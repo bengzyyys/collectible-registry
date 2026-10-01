@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Registry 是一个已打开的本地登记册。同一目录同时只能被一个 Registry
@@ -19,6 +20,8 @@ type Registry struct {
 	state  *snapshot
 	mu     sync.Mutex
 	closed bool
+	// now 返回当前时间，到期判断以此为准；生产环境为 time.Now，测试可替换。
+	now func() time.Time
 }
 
 // Create 在 dir 新建并打开一个空登记册。调用者通过 dir 指定本机数据
@@ -51,7 +54,7 @@ func Create(dir string) (*Registry, error) {
 		_ = releaseLock(lock)
 		return nil, err
 	}
-	return &Registry{dir: dir, store: st, state: s}, nil
+	return &Registry{dir: dir, store: st, state: s, now: time.Now}, nil
 }
 
 // Open 打开 dir 中的已有登记册。数据文件缺失视为空目录的新建场景，
@@ -84,7 +87,7 @@ func Open(dir string) (*Registry, error) {
 		_ = releaseLock(lock)
 		return nil, err
 	}
-	return &Registry{dir: dir, store: &store{dir: dir, lock: lock}, state: s}, nil
+	return &Registry{dir: dir, store: &store{dir: dir, lock: lock}, state: s, now: time.Now}, nil
 }
 
 // Close 正常关闭登记册并释放独占锁。关闭后不能再调用其他方法。
@@ -541,6 +544,544 @@ func (r *Registry) replayTransfer(prev request, sig string) (TransferResult, err
 	return res, nil
 }
 
+// ---- 限时一次性代转授权 ----
+
+// authzCurrentStatus 计算授权当前状态。撤销与使用是落盘的终态；到期不
+// 落盘，按当前时间实时判断——从到期时间点起即视为已过期。
+func authzCurrentStatus(a authzRec, now time.Time) string {
+	switch a.Status {
+	case "revoked":
+		return AuthRevoked
+	case "used":
+		return AuthUsed
+	}
+	if !a.ExpiresAt.IsZero() && !now.Before(a.ExpiresAt) {
+		return AuthExpired
+	}
+	return AuthActive
+}
+
+func (req CreateAuthorizationRequest) validatePresent() error {
+	missing := []string{}
+	if strings.TrimSpace(req.Operator) == "" {
+		missing = append(missing, "operator")
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		missing = append(missing, "reason")
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		missing = append(missing, "request_id")
+	}
+	if strings.TrimSpace(req.AuthID) == "" {
+		missing = append(missing, "auth_id")
+	}
+	if strings.TrimSpace(req.ItemID) == "" {
+		missing = append(missing, "item_id")
+	}
+	if strings.TrimSpace(req.TrusteeID) == "" {
+		missing = append(missing, "trustee_id")
+	}
+	if strings.TrimSpace(req.ToID) == "" {
+		missing = append(missing, "to_id")
+	}
+	if strings.TrimSpace(req.ExpectedOwner) == "" {
+		missing = append(missing, "expected_owner")
+	}
+	if req.ExpectedVer <= 0 {
+		missing = append(missing, "expected_version")
+	}
+	if req.ExpiresAt.IsZero() {
+		missing = append(missing, "expires_at")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: 创建授权请求缺少必填字段 %s", ErrInvalidArgument, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func createAuthzParamsSig(req CreateAuthorizationRequest) string {
+	b, _ := json.Marshal(struct {
+		Kind          string `json:"kind"`
+		AuthID        string `json:"auth_id"`
+		ItemID        string `json:"item_id"`
+		TrusteeID     string `json:"trustee_id"`
+		ToID          string `json:"to_id"`
+		ExpectedOwner string `json:"expected_owner"`
+		ExpectedVer   int64  `json:"expected_version"`
+		ExpiresAt     string `json:"expires_at"`
+		Reason        string `json:"reason"`
+	}{"auth_create", req.AuthID, req.ItemID, req.TrusteeID, req.ToID,
+		req.ExpectedOwner, req.ExpectedVer,
+		req.ExpiresAt.UTC().Format(time.RFC3339Nano), req.Reason})
+	return string(b)
+}
+
+// CreateAuthorization 由当前持有人为一件已发行藏品创建限时、一次性的
+// 代转授权：指定唯一授权编号、受托账户、固定接收账户、绝对到期时间，
+// 以及期望持有人与期望版本。授权绑定创建时的持有版本，不改变持有关系，
+// 也不限制持有人继续直接转让。受托人不能是授权人；受托人可与接收人
+// 相同，但接收人也不能是授权人。到期时间必须晚于当前时间。
+//
+// 请求号与发行、转让共用同一操作者的请求号范围：相同业务参数重提返回
+// 首次结果（成功或状态类业务拒绝），参数变化返回 ErrRequestConflict；
+// 参数错误与引用不存在不占用请求号。
+func (r *Registry) CreateAuthorization(req CreateAuthorizationRequest) (CreateAuthorizationResult, error) {
+	if err := req.validatePresent(); err != nil {
+		return CreateAuthorizationResult{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.checkOpen(); err != nil {
+		return CreateAuthorizationResult{}, err
+	}
+
+	now := r.now()
+	key := requestKey(req.Operator, req.RequestID)
+	sig := createAuthzParamsSig(req)
+	if prev, ok := r.state.Requests[key]; ok {
+		return r.replayCreateAuthz(prev, sig)
+	}
+
+	if bizErr := r.checkCreateAuthorization(req, now); bizErr != nil {
+		if !isValidationErr(bizErr) {
+			// 状态类业务拒绝（编号占用、停用、同人、版本不符、到期时间
+			// 已过等）占用请求号并落盘；参数错误与引用不存在不占用。
+			r.state.Requests[key] = request{
+				Operator: req.Operator, RequestID: req.RequestID, Kind: "auth_create",
+				Params: sig, Rejected: true, Reason: errCode(bizErr),
+				AuthID: req.AuthID, ItemID: req.ItemID,
+			}
+			_ = r.commit()
+		}
+		return CreateAuthorizationResult{AuthID: req.AuthID, Err: bizErr}, bizErr
+	}
+
+	h := r.state.Holdings[req.ItemID]
+	a := authzRec{
+		ID: req.AuthID, ItemID: req.ItemID, GranterID: req.Operator,
+		TrusteeID: req.TrusteeID, ToID: req.ToID, ExpiresAt: req.ExpiresAt,
+		GrantVer: h.Version, CreatedAt: now,
+	}
+	r.state.Authzs[req.AuthID] = a
+	authSeq := r.state.NextAuthSeq + 1
+	r.state.NextAuthSeq = authSeq
+	r.state.AuthEvents = append(r.state.AuthEvents, authzEvent{
+		Seq: authSeq, AuthID: req.AuthID, ItemID: req.ItemID, Kind: "create",
+		Operator: req.Operator, Reason: req.Reason, RequestID: req.RequestID,
+		FromStatus: "", ToStatus: AuthActive, OccurredAt: now,
+	})
+	r.state.Requests[key] = request{
+		Operator: req.Operator, RequestID: req.RequestID, Kind: "auth_create",
+		Params: sig, AuthID: req.AuthID, ItemID: req.ItemID, Version: h.Version,
+	}
+	if err := r.commit(); err != nil {
+		return CreateAuthorizationResult{}, err
+	}
+	return CreateAuthorizationResult{AuthID: req.AuthID, Status: AuthActive, GrantVer: h.Version}, nil
+}
+
+func (r *Registry) checkCreateAuthorization(req CreateAuthorizationRequest, now time.Time) error {
+	h, ok := r.state.Holdings[req.ItemID]
+	if !ok {
+		if _, itemExists := r.state.Items[req.ItemID]; !itemExists {
+			return fmt.Errorf("%w: 藏品 %s", ErrNotFound, req.ItemID)
+		}
+		return fmt.Errorf("%w: 藏品 %s 没有持有记录", ErrNotFound, req.ItemID)
+	}
+	op, ok := r.state.Accounts[req.Operator]
+	if !ok {
+		return fmt.Errorf("%w: 授权人账户 %s", ErrNotFound, req.Operator)
+	}
+	trustee, ok := r.state.Accounts[req.TrusteeID]
+	if !ok {
+		return fmt.Errorf("%w: 受托人账户 %s", ErrNotFound, req.TrusteeID)
+	}
+	to, ok := r.state.Accounts[req.ToID]
+	if !ok {
+		return fmt.Errorf("%w: 接收账户 %s", ErrNotFound, req.ToID)
+	}
+	if req.TrusteeID == req.Operator {
+		return fmt.Errorf("%w: 受托人不能是授权人 %s", ErrSameAccount, req.Operator)
+	}
+	if req.ToID == req.Operator {
+		return fmt.Errorf("%w: 接收人不能是授权人 %s", ErrSameAccount, req.Operator)
+	}
+	if !op.Active {
+		return fmt.Errorf("%w: 授权人账户 %s", ErrAccountInactive, req.Operator)
+	}
+	if !trustee.Active {
+		return fmt.Errorf("%w: 受托人账户 %s", ErrAccountInactive, req.TrusteeID)
+	}
+	if !to.Active {
+		return fmt.Errorf("%w: 接收账户 %s", ErrAccountInactive, req.ToID)
+	}
+	// 授权编号占用是对象级冲突，优先于当前时间与持有版本检查。
+	if _, exists := r.state.Authzs[req.AuthID]; exists {
+		return fmt.Errorf("%w: 授权编号 %s 已被占用", ErrAlreadyExists, req.AuthID)
+	}
+	// 到期时间不晚于当前时间即为参数错误；从到期时间点起不可使用。
+	if !req.ExpiresAt.After(now) {
+		return fmt.Errorf("%w: 到期时间 %s 必须晚于当前时间",
+			ErrInvalidArgument, req.ExpiresAt.Format(time.RFC3339Nano))
+	}
+	if h.OwnerID != req.ExpectedOwner || h.Version != req.ExpectedVer ||
+		req.Operator != h.OwnerID {
+		return fmt.Errorf("%w: 藏品 %s 当前为 %s 版本 %d",
+			ErrConflict, req.ItemID, h.OwnerID, h.Version)
+	}
+	return nil
+}
+
+func (r *Registry) replayCreateAuthz(prev request, sig string) (CreateAuthorizationResult, error) {
+	if prev.Kind != "auth_create" || prev.Params != sig {
+		return CreateAuthorizationResult{}, fmt.Errorf("%w: 操作者 %s 的请求号 %s 已用于不同请求",
+			ErrRequestConflict, prev.Operator, prev.RequestID)
+	}
+	res := CreateAuthorizationResult{AuthID: prev.AuthID, GrantVer: prev.Version,
+		Status: AuthActive, Replayed: true}
+	if prev.Rejected {
+		res.Err = codeErr(prev.Reason)
+		return res, res.Err
+	}
+	return res, nil
+}
+
+func revokeAuthzParamsSig(req RevokeAuthorizationRequest) string {
+	b, _ := json.Marshal(struct {
+		Kind   string `json:"kind"`
+		AuthID string `json:"auth_id"`
+		Reason string `json:"reason"`
+	}{"auth_revoke", req.AuthID, req.Reason})
+	return string(b)
+}
+
+// RevokeAuthorization 撤销一份尚未使用的代转授权。仅授权人可以撤销；
+// 已使用的授权不能撤销（返回 ErrAuthorizationUsed）。授权已撤销时再次
+// 撤销不新增授权变更记录，按成功返回。请求号语义与其他操作一致。
+func (r *Registry) RevokeAuthorization(req RevokeAuthorizationRequest) (RevokeAuthorizationResult, error) {
+	missing := []string{}
+	if strings.TrimSpace(req.Operator) == "" {
+		missing = append(missing, "operator")
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		missing = append(missing, "reason")
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		missing = append(missing, "request_id")
+	}
+	if strings.TrimSpace(req.AuthID) == "" {
+		missing = append(missing, "auth_id")
+	}
+	if len(missing) > 0 {
+		return RevokeAuthorizationResult{}, fmt.Errorf("%w: 撤销授权请求缺少必填字段 %s",
+			ErrInvalidArgument, strings.Join(missing, ", "))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.checkOpen(); err != nil {
+		return RevokeAuthorizationResult{}, err
+	}
+
+	now := r.now()
+	key := requestKey(req.Operator, req.RequestID)
+	sig := revokeAuthzParamsSig(req)
+	if prev, ok := r.state.Requests[key]; ok {
+		return r.replayRevokeAuthz(prev, sig)
+	}
+
+	a, ok := r.state.Authzs[req.AuthID]
+	if !ok {
+		// 引用不存在不占用请求号。
+		err := fmt.Errorf("%w: 授权 %s", ErrNotFound, req.AuthID)
+		return RevokeAuthorizationResult{AuthID: req.AuthID, Err: err}, err
+	}
+	if a.GranterID != req.Operator {
+		bizErr := fmt.Errorf("%w: 只有授权人 %s 可以撤销授权 %s",
+			ErrForbidden, a.GranterID, req.AuthID)
+		r.recordAuthzRequest(key, sig, req, "auth_revoke", bizErr)
+		return RevokeAuthorizationResult{AuthID: req.AuthID, Err: bizErr}, bizErr
+	}
+	switch authzCurrentStatus(a, now) {
+	case AuthUsed:
+		bizErr := fmt.Errorf("%w: 授权 %s 已使用，不能撤销", ErrAuthorizationUsed, req.AuthID)
+		r.recordAuthzRequest(key, sig, req, "auth_revoke", bizErr)
+		return RevokeAuthorizationResult{AuthID: req.AuthID, Err: bizErr}, bizErr
+	case AuthRevoked:
+		// 已撤销是幂等终态：不新增授权变更记录；该请求号仍登记为成功，
+		// 相同请求重放回放同一结果。
+		r.state.Requests[key] = request{
+			Operator: req.Operator, RequestID: req.RequestID, Kind: "auth_revoke",
+			Params: sig, AuthID: req.AuthID,
+		}
+		if err := r.commit(); err != nil {
+			return RevokeAuthorizationResult{}, err
+		}
+		return RevokeAuthorizationResult{AuthID: req.AuthID, Status: AuthRevoked}, nil
+	}
+
+	from := AuthActive
+	if authzCurrentStatus(a, now) == AuthExpired {
+		from = AuthExpired
+	}
+	a.Status = "revoked"
+	a.RevokedAt = now
+	r.state.Authzs[req.AuthID] = a
+	authSeq := r.state.NextAuthSeq + 1
+	r.state.NextAuthSeq = authSeq
+	r.state.AuthEvents = append(r.state.AuthEvents, authzEvent{
+		Seq: authSeq, AuthID: req.AuthID, ItemID: a.ItemID, Kind: "revoke",
+		Operator: req.Operator, Reason: req.Reason, RequestID: req.RequestID,
+		FromStatus: from, ToStatus: AuthRevoked, OccurredAt: now,
+	})
+	r.state.Requests[key] = request{
+		Operator: req.Operator, RequestID: req.RequestID, Kind: "auth_revoke",
+		Params: sig, AuthID: req.AuthID,
+	}
+	if err := r.commit(); err != nil {
+		return RevokeAuthorizationResult{}, err
+	}
+	return RevokeAuthorizationResult{AuthID: req.AuthID, Status: AuthRevoked}, nil
+}
+
+// recordAuthzRequest 记录授权类操作的状态类业务拒绝并尽力落盘。
+func (r *Registry) recordAuthzRequest(key, sig string, req RevokeAuthorizationRequest, kind string, bizErr error) {
+	r.state.Requests[key] = request{
+		Operator: req.Operator, RequestID: req.RequestID, Kind: kind,
+		Params: sig, Rejected: true, Reason: errCode(bizErr), AuthID: req.AuthID,
+	}
+	_ = r.commit()
+}
+
+func (r *Registry) replayRevokeAuthz(prev request, sig string) (RevokeAuthorizationResult, error) {
+	if prev.Kind != "auth_revoke" || prev.Params != sig {
+		return RevokeAuthorizationResult{}, fmt.Errorf("%w: 操作者 %s 的请求号 %s 已用于不同请求",
+			ErrRequestConflict, prev.Operator, prev.RequestID)
+	}
+	res := RevokeAuthorizationResult{AuthID: prev.AuthID, Status: AuthRevoked, Replayed: true}
+	if prev.Rejected {
+		res.Err = codeErr(prev.Reason)
+		res.Status = ""
+		return res, res.Err
+	}
+	return res, nil
+}
+
+func proxyTransferParamsSig(req ProxyTransferRequest) string {
+	b, _ := json.Marshal(struct {
+		Kind   string `json:"kind"`
+		AuthID string `json:"auth_id"`
+		Reason string `json:"reason"`
+	}{"proxy_transfer", req.AuthID, req.Reason})
+	return string(b)
+}
+
+// ProxyTransfer 由受托人凭授权发起一次性代转。藏品与接收人均以授权
+// 记载为准，请求本身不能指定。成功后持有人变为授权中的接收人、持有
+// 版本加一，授权记为已使用并关联该笔转让；代转同样出现在藏品历史中，
+// 操作者记为实际受托账户并可通过授权编号追溯。
+//
+// 非受托人（ErrForbidden）、授权已撤销（ErrAuthorizationRevoked）、
+// 已到期（ErrAuthorizationExpired）、已使用（ErrAuthorizationUsed）、
+// 任一相关账户停用（ErrAccountInactive）以及持有版本已变化
+// （ErrConflict，即使藏品回到授权人手中也不恢复）分别明确拒绝，拒绝
+// 不改变持有或授权状态。成功代转用原请求号重放时，即使授权已到期、
+// 账户已停用或藏品再次易手，仍返回首次的转让结果。
+func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult, error) {
+	missing := []string{}
+	if strings.TrimSpace(req.Operator) == "" {
+		missing = append(missing, "operator")
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		missing = append(missing, "reason")
+	}
+	if strings.TrimSpace(req.RequestID) == "" {
+		missing = append(missing, "request_id")
+	}
+	if strings.TrimSpace(req.AuthID) == "" {
+		missing = append(missing, "auth_id")
+	}
+	if len(missing) > 0 {
+		return ProxyTransferResult{}, fmt.Errorf("%w: 代转请求缺少必填字段 %s",
+			ErrInvalidArgument, strings.Join(missing, ", "))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.checkOpen(); err != nil {
+		return ProxyTransferResult{}, err
+	}
+
+	now := r.now()
+	key := requestKey(req.Operator, req.RequestID)
+	sig := proxyTransferParamsSig(req)
+	if prev, ok := r.state.Requests[key]; ok {
+		return r.replayProxyTransfer(prev, sig)
+	}
+
+	if bizErr := r.checkProxyTransfer(req, now); bizErr != nil {
+		if !isValidationErr(bizErr) {
+			r.state.Requests[key] = request{
+				Operator: req.Operator, RequestID: req.RequestID, Kind: "proxy_transfer",
+				Params: sig, Rejected: true, Reason: errCode(bizErr), AuthID: req.AuthID,
+			}
+			_ = r.commit()
+		}
+		return ProxyTransferResult{AuthID: req.AuthID, Err: bizErr}, bizErr
+	}
+
+	a := r.state.Authzs[req.AuthID]
+	h := r.state.Holdings[a.ItemID]
+	seq := r.state.NextSeq + 1
+	r.state.NextSeq = seq
+	from := h.OwnerID
+	fromVer := h.Version
+	h.OwnerID = a.ToID
+	h.Version = fromVer + 1
+	r.state.Holdings[a.ItemID] = h
+	r.state.History = append(r.state.History, historyEntry{
+		Seq: seq, Kind: "transfer", ItemID: a.ItemID, Operator: req.Operator,
+		Reason: req.Reason, RequestID: req.RequestID,
+		FromID: from, ToID: a.ToID, FromVersion: fromVer, ToVersion: fromVer + 1,
+		AuthID: a.ID,
+	})
+	a.Status = "used"
+	a.UsedTxSeq = seq
+	a.UsedAt = now
+	r.state.Authzs[a.ID] = a
+	authSeq := r.state.NextAuthSeq + 1
+	r.state.NextAuthSeq = authSeq
+	r.state.AuthEvents = append(r.state.AuthEvents, authzEvent{
+		Seq: authSeq, AuthID: a.ID, ItemID: a.ItemID, Kind: "use",
+		Operator: req.Operator, Reason: req.Reason, RequestID: req.RequestID,
+		FromStatus: AuthActive, ToStatus: AuthUsed, TxSeq: seq, OccurredAt: now,
+	})
+	r.state.Requests[key] = request{
+		Operator: req.Operator, RequestID: req.RequestID, Kind: "proxy_transfer",
+		Params: sig, AuthID: a.ID, ItemID: a.ItemID, FromID: from, ToID: a.ToID,
+		Version: fromVer + 1, TxSeq: seq,
+	}
+	if err := r.commit(); err != nil {
+		return ProxyTransferResult{}, err
+	}
+	return ProxyTransferResult{AuthID: a.ID, ItemID: a.ItemID, FromID: from,
+		ToID: a.ToID, Version: fromVer + 1, TxSeq: seq}, nil
+}
+
+func (r *Registry) checkProxyTransfer(req ProxyTransferRequest, now time.Time) error {
+	a, ok := r.state.Authzs[req.AuthID]
+	if !ok {
+		return fmt.Errorf("%w: 授权 %s", ErrNotFound, req.AuthID)
+	}
+	op, ok := r.state.Accounts[req.Operator]
+	if !ok {
+		return fmt.Errorf("%w: 受托人账户 %s", ErrNotFound, req.Operator)
+	}
+	granter, gOk := r.state.Accounts[a.GranterID]
+	to, tOk := r.state.Accounts[a.ToID]
+	if req.Operator != a.TrusteeID {
+		return fmt.Errorf("%w: 账户 %s 不是授权 %s 的受托人",
+			ErrForbidden, req.Operator, req.AuthID)
+	}
+	if !gOk {
+		return fmt.Errorf("%w: 授权人账户 %s", ErrNotFound, a.GranterID)
+	}
+	if !tOk {
+		return fmt.Errorf("%w: 接收账户 %s", ErrNotFound, a.ToID)
+	}
+	if !op.Active {
+		return fmt.Errorf("%w: 受托人账户 %s", ErrAccountInactive, req.Operator)
+	}
+	if !granter.Active {
+		return fmt.Errorf("%w: 授权人账户 %s", ErrAccountInactive, a.GranterID)
+	}
+	if !to.Active {
+		return fmt.Errorf("%w: 接收账户 %s", ErrAccountInactive, a.ToID)
+	}
+	switch authzCurrentStatus(a, now) {
+	case AuthRevoked:
+		return fmt.Errorf("%w: 授权 %s", ErrAuthorizationRevoked, req.AuthID)
+	case AuthExpired:
+		return fmt.Errorf("%w: 授权 %s", ErrAuthorizationExpired, req.AuthID)
+	case AuthUsed:
+		return fmt.Errorf("%w: 授权 %s", ErrAuthorizationUsed, req.AuthID)
+	}
+	// 授权只在创建时绑定的持有版本上有效；版本单调递增，藏品即使回到
+	// 授权人手中也不会回到旧版本，旧授权据此永久失效。
+	h, ok := r.state.Holdings[a.ItemID]
+	if !ok {
+		return fmt.Errorf("%w: 藏品 %s 没有持有记录", ErrNotFound, a.ItemID)
+	}
+	if h.OwnerID != a.GranterID || h.Version != a.GrantVer {
+		return fmt.Errorf("%w: 藏品 %s 当前为 %s 版本 %d，授权绑定 %s 版本 %d",
+			ErrConflict, a.ItemID, h.OwnerID, h.Version, a.GranterID, a.GrantVer)
+	}
+	return nil
+}
+
+func (r *Registry) replayProxyTransfer(prev request, sig string) (ProxyTransferResult, error) {
+	if prev.Kind != "proxy_transfer" || prev.Params != sig {
+		return ProxyTransferResult{}, fmt.Errorf("%w: 操作者 %s 的请求号 %s 已用于不同请求",
+			ErrRequestConflict, prev.Operator, prev.RequestID)
+	}
+	res := ProxyTransferResult{AuthID: prev.AuthID, ItemID: prev.ItemID, FromID: prev.FromID,
+		ToID: prev.ToID, Version: prev.Version, TxSeq: prev.TxSeq, Replayed: true}
+	if prev.Rejected {
+		res.Err = codeErr(prev.Reason)
+		return res, res.Err
+	}
+	return res, nil
+}
+
+// ---- 授权查询 ----
+
+// GetAuthorization 按编号查询授权内容与撤销、使用状态。授权不存在时
+// 返回包裹 ErrNotFound 的错误；返回的 Status 按当前时间实时计算，
+// 到期但尚未终结的授权返回 AuthExpired。
+func (r *Registry) GetAuthorization(authID string) (Authorization, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.checkOpen(); err != nil {
+		return Authorization{}, err
+	}
+	a, ok := r.state.Authzs[authID]
+	if !ok {
+		return Authorization{}, fmt.Errorf("%w: 授权 %s", ErrNotFound, authID)
+	}
+	return Authorization{
+		ID: a.ID, ItemID: a.ItemID, GranterID: a.GranterID, TrusteeID: a.TrusteeID,
+		ToID: a.ToID, ExpiresAt: a.ExpiresAt, GrantVer: a.GrantVer,
+		Status:    authzCurrentStatus(a, r.now()),
+		UsedTxSeq: a.UsedTxSeq, UsedAt: a.UsedAt, CreatedAt: a.CreatedAt,
+		RevokedAt: a.RevokedAt,
+	}, nil
+}
+
+// AuthorizationHistory 按藏品查看授权变更记录（创建、撤销、使用），
+// 按发生先后排列；每条记录包含操作者、原因、请求号与前后状态。藏品
+// 不存在时返回包裹 ErrNotFound 的错误。
+func (r *Registry) AuthorizationHistory(itemID string) ([]AuthorizationEvent, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.checkOpen(); err != nil {
+		return nil, err
+	}
+	if _, ok := r.state.Items[itemID]; !ok {
+		return nil, fmt.Errorf("%w: 藏品 %s", ErrNotFound, itemID)
+	}
+	out := make([]AuthorizationEvent, 0)
+	for _, e := range r.state.AuthEvents {
+		if e.ItemID != itemID {
+			continue
+		}
+		out = append(out, AuthorizationEvent{
+			Seq: e.Seq, AuthID: e.AuthID, ItemID: e.ItemID, Kind: e.Kind,
+			Operator: e.Operator, Reason: e.Reason, RequestID: e.RequestID,
+			FromStatus: e.FromStatus, ToStatus: e.ToStatus, TxSeq: e.TxSeq,
+			OccurredAt: e.OccurredAt,
+		})
+	}
+	return out, nil
+}
+
 // ---- 查询 ----
 
 // GetItem 查询单件藏品的静态登记信息；不存在时返回包裹 ErrNotFound 的错误。
@@ -613,7 +1154,7 @@ func (r *Registry) History(itemID string) ([]HistoryEntry, error) {
 		out = append(out, HistoryEntry{
 			Seq: e.Seq, Kind: e.Kind, ItemID: e.ItemID, Operator: e.Operator,
 			Reason: e.Reason, RequestID: e.RequestID, FromID: e.FromID, ToID: e.ToID,
-			FromVersion: e.FromVersion, ToVersion: e.ToVersion,
+			FromVersion: e.FromVersion, ToVersion: e.ToVersion, AuthID: e.AuthID,
 		})
 	}
 	return out, nil
@@ -635,23 +1176,29 @@ func isValidationErr(err error) bool {
 }
 
 var errCodes = map[error]string{
-	ErrNotFound:        "not_found",
-	ErrAlreadyExists:   "already_exists",
-	ErrAccountInactive: "account_inactive",
-	ErrSeriesSealed:    "series_sealed",
-	ErrConflict:        "conflict",
-	ErrSameAccount:     "same_account",
-	ErrForbidden:       "forbidden",
+	ErrNotFound:             "not_found",
+	ErrAlreadyExists:        "already_exists",
+	ErrAccountInactive:      "account_inactive",
+	ErrSeriesSealed:         "series_sealed",
+	ErrConflict:             "conflict",
+	ErrSameAccount:          "same_account",
+	ErrForbidden:            "forbidden",
+	ErrAuthorizationRevoked: "authorization_revoked",
+	ErrAuthorizationExpired: "authorization_expired",
+	ErrAuthorizationUsed:    "authorization_used",
 }
 
 var codeErrs = map[string]error{
-	"not_found":        ErrNotFound,
-	"already_exists":   ErrAlreadyExists,
-	"account_inactive": ErrAccountInactive,
-	"series_sealed":    ErrSeriesSealed,
-	"conflict":         ErrConflict,
-	"same_account":     ErrSameAccount,
-	"forbidden":        ErrForbidden,
+	"not_found":             ErrNotFound,
+	"already_exists":        ErrAlreadyExists,
+	"account_inactive":      ErrAccountInactive,
+	"series_sealed":         ErrSeriesSealed,
+	"conflict":              ErrConflict,
+	"same_account":          ErrSameAccount,
+	"forbidden":             ErrForbidden,
+	"authorization_revoked": ErrAuthorizationRevoked,
+	"authorization_expired": ErrAuthorizationExpired,
+	"authorization_used":    ErrAuthorizationUsed,
 }
 
 func errCode(err error) string {

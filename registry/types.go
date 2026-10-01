@@ -1,5 +1,7 @@
 package registry
 
+import "time"
+
 // Account 是账户登记信息。停用后仍可查询其原有藏品与历史。
 type Account struct {
 	ID       string // 唯一编号
@@ -34,7 +36,7 @@ type Holding struct {
 // HistoryEntry 是一条发行或成功转让记录，按发生先后排列。
 type HistoryEntry struct {
 	Seq       int64  // 严格递增的记录序号，也即发生顺序
-	Kind      string // "issue" 或 "transfer"
+	Kind      string // "issue" 或 "transfer"（代转仍为 transfer）
 	ItemID    string // 藏品编号
 	Operator  string // 操作者账户编号
 	Reason    string // 操作原因
@@ -47,6 +49,8 @@ type HistoryEntry struct {
 	FromVersion int64
 	// ToVersion 是转让后持有版本（发行后为 1）。
 	ToVersion int64
+	// AuthID 是代转所使用的授权编号；直接转让与发行时为空。
+	AuthID string
 }
 
 // IssueRequest 是发行请求的业务参数（幂等判定以此为准）。
@@ -84,6 +88,111 @@ type IssueResult struct {
 
 // TransferResult 是转让请求的处理结果。
 type TransferResult struct {
+	ItemID   string // 藏品编号
+	FromID   string // 转让前持有人
+	ToID     string // 转让后持有人
+	Version  int64  // 转让后版本
+	TxSeq    int64  // 转让历史序号
+	Replayed bool   // 是否为重复提交回放的首次结果
+	Err      error  // 业务拒绝；成功时为 nil
+}
+
+// 授权生命周期状态。
+const (
+	// AuthActive 表示授权已创建，尚未撤销、过期或使用。
+	AuthActive = "active"
+	// AuthRevoked 表示授权已被授权人撤销。
+	AuthRevoked = "revoked"
+	// AuthExpired 表示授权已过到期时间且尚未使用。
+	AuthExpired = "expired"
+	// AuthUsed 表示授权已用于一次成功代转。
+	AuthUsed = "used"
+)
+
+// CreateAuthorizationRequest 是创建限时一次性代转授权的业务参数
+// （幂等判定以此为准）。
+type CreateAuthorizationRequest struct {
+	Operator      string    // 操作者，必须是当前持有人（授权人）且可用
+	Reason        string    // 原因
+	RequestID     string    // 请求号，与发行、转让共用同一操作者的请求号范围
+	AuthID        string    // 唯一授权编号
+	ItemID        string    // 已发行藏品编号
+	TrusteeID     string    // 受托账户，可凭授权发起代转
+	ToID          string    // 固定接收账户，代转只能转入该账户
+	ExpectedOwner string    // 期望当前持有人
+	ExpectedVer   int64     // 期望当前持有版本；授权绑定该持有版本
+	ExpiresAt     time.Time // 绝对到期时间，必须晚于当前时间
+}
+
+// RevokeAuthorizationRequest 是撤销授权的业务参数。
+type RevokeAuthorizationRequest struct {
+	Operator  string // 操作者，必须是授权人
+	Reason    string // 原因
+	RequestID string // 请求号
+	AuthID    string // 待撤销的授权编号
+}
+
+// ProxyTransferRequest 是受托人凭授权发起代转的业务参数。
+type ProxyTransferRequest struct {
+	Operator  string // 操作者，必须是授权的受托人
+	Reason    string // 原因
+	RequestID string // 请求号
+	AuthID    string // 使用的授权编号
+}
+
+// Authorization 是一份代转授权的当前内容与状态。
+type Authorization struct {
+	ID        string    // 授权编号
+	ItemID    string    // 绑定的藏品
+	GranterID string    // 授权人（创建时的持有人）
+	TrusteeID string    // 受托账户
+	ToID      string    // 固定接收账户
+	ExpiresAt time.Time // 绝对到期时间
+	GrantVer  int64     // 创建时绑定的持有版本
+	Status    string    // 当前状态：AuthActive/AuthRevoked/AuthExpired/AuthUsed
+	UsedTxSeq int64     // 成功代转的历史序号；未使用为 0
+	UsedAt    time.Time // 成功代转时间；未使用为零值
+	CreatedAt time.Time // 创建时间
+	RevokedAt time.Time // 撤销时间；未撤销为零值
+}
+
+// AuthorizationEvent 是授权变更记录中的一条。
+type AuthorizationEvent struct {
+	Seq        int64     // 授权变更记录内严格递增的序号
+	AuthID     string    // 授权编号
+	ItemID     string    // 藏品编号
+	Kind       string    // "create" / "revoke" / "use"
+	Operator   string    // 操作者账户编号（use 时为受托人）
+	Reason     string    // 操作原因
+	RequestID  string    // 请求号
+	FromStatus string    // 变更前状态（create 前为空）
+	ToStatus   string    // 变更后状态
+	TxSeq      int64     // use 时关联的藏品转让历史序号，否则为 0
+	OccurredAt time.Time // 发生时间
+}
+
+// CreateAuthorizationResult 是创建授权的结果。
+type CreateAuthorizationResult struct {
+	AuthID   string
+	Status   string
+	GrantVer int64
+	Replayed bool
+	Err      error
+}
+
+// RevokeAuthorizationResult 是撤销授权的结果。Replayed 为 true 表示该
+// (操作者, 请求号) 曾成功或处于状态类业务拒绝；已撤销后再次撤销也回放
+// 首次结果。
+type RevokeAuthorizationResult struct {
+	AuthID   string
+	Status   string
+	Replayed bool
+	Err      error
+}
+
+// ProxyTransferResult 是代转的结果，字段语义与 TransferResult 一致。
+type ProxyTransferResult struct {
+	AuthID   string // 使用的授权编号
 	ItemID   string // 藏品编号
 	FromID   string // 转让前持有人
 	ToID     string // 转让后持有人

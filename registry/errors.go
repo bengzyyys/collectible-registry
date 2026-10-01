@@ -23,8 +23,20 @@ var (
 	// ErrSameAccount 表示转让的发起人与接收人相同。
 	ErrSameAccount = errors.New("registry: 转让发起人与接收人不能相同")
 
-	// ErrForbidden 表示操作者无权执行该操作（例如非系列创建账户发行或封存）。
+	// ErrForbidden 表示操作者无权执行该操作（例如非系列创建账户发行或封存、
+	// 非授权人撤销授权、非受托人发起代转）。
 	ErrForbidden = errors.New("registry: 操作者无权执行该操作")
+
+	// ErrAuthorizationRevoked 表示代转授权已被授权人撤销，不能再用于代转。
+	ErrAuthorizationRevoked = errors.New("registry: 授权已撤销")
+
+	// ErrAuthorizationExpired 表示代转授权已过绝对到期时间，从到期时间点
+	// 起不可再使用。
+	ErrAuthorizationExpired = errors.New("registry: 授权已过期")
+
+	// ErrAuthorizationUsed 表示一次性代转授权已被使用（或对已使用的授权
+	// 请求撤销）。
+	ErrAuthorizationUsed = errors.New("registry: 授权已使用")
 
 	// ErrRequestConflict 表示请求号已被同一操作者使用，但本次业务参数不同。
 	ErrRequestConflict = errors.New("registry: 请求号冲突")
