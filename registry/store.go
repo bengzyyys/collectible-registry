@@ -1,0 +1,205 @@
+package registry
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"syscall"
+)
+
+// stateVersion 是快照格式的版本标记，未来不兼容变更时可据此识别。
+const stateVersion = 1
+
+const (
+	dirMode  = 0o755
+	fileMode = 0o644
+)
+
+// snapshot 是登记册的全量落盘结构。账户、系列、藏品、持有、历史与
+// 请求结果都在同一个快照中，一次操作一次原子替换，保证"藏品已换人
+// 就一定有对应历史"。
+type snapshot struct {
+	Version  int                `json:"version"`
+	Accounts map[string]account `json:"accounts"`
+	Series   map[string]series  `json:"series"`
+	Items    map[string]item    `json:"items"`
+	Holdings map[string]holding `json:"holdings"`
+	History  []historyEntry     `json:"history"`
+	Requests map[string]request `json:"requests"`
+	NextSeq  int64              `json:"next_seq"`
+}
+
+type account struct {
+	ID       string `json:"id"`
+	Metadata string `json:"metadata"`
+	Active   bool   `json:"active"`
+}
+
+type series struct {
+	ID        string `json:"id"`
+	CreatorID string `json:"creator_id"`
+	Metadata  string `json:"metadata"`
+	Sealed    bool   `json:"sealed"`
+}
+
+type item struct {
+	ID         string `json:"id"`
+	SeriesID   string `json:"series_id"`
+	BatchNo    string `json:"batch_no"`
+	Metadata   string `json:"metadata"`
+	IssuedTxID int64  `json:"issued_tx_id"`
+}
+
+type holding struct {
+	ItemID  string `json:"item_id"`
+	OwnerID string `json:"owner_id"`
+	Version int64  `json:"version"`
+}
+
+type historyEntry struct {
+	Seq         int64  `json:"seq"`
+	Kind        string `json:"kind"`
+	ItemID      string `json:"item_id"`
+	Operator    string `json:"operator"`
+	Reason      string `json:"reason"`
+	RequestID   string `json:"request_id"`
+	FromID      string `json:"from_id"`
+	ToID        string `json:"to_id"`
+	FromVersion int64  `json:"from_version"`
+	ToVersion   int64  `json:"to_version"`
+}
+
+// request 保存每个 (操作者, 请求号) 的首次结果，用于幂等回放。
+// 同一操作者的请求号在发行与转让两类操作间共用。
+type request struct {
+	Operator  string `json:"operator"`
+	RequestID string `json:"request_id"`
+	Kind      string `json:"kind"` // "issue" / "transfer"
+	// 规范化后的业务参数签名。签名一致才回放；不一致报请求号冲突。
+	Params string `json:"params"`
+	// 业务拒绝也落盘：相同参数重提返回首次的拒绝。
+	Rejected bool   `json:"rejected"`
+	Reason   string `json:"reject_reason"` // 哨兵错误对应的稳定标识
+	// 成功结果。
+	ItemID  string `json:"item_id,omitempty"`
+	FromID  string `json:"from_id,omitempty"`
+	ToID    string `json:"to_id,omitempty"`
+	Version int64  `json:"version,omitempty"`
+	TxSeq   int64  `json:"tx_seq,omitempty"`
+}
+
+func newSnapshot() *snapshot {
+	return &snapshot{
+		Version:  stateVersion,
+		Accounts: make(map[string]account),
+		Series:   make(map[string]series),
+		Items:    make(map[string]item),
+		Holdings: make(map[string]holding),
+		Requests: make(map[string]request),
+	}
+}
+
+func (s *snapshot) validate() error {
+	if s.Version != stateVersion {
+		return fmt.Errorf("%w: 不支持的快照版本 %d", ErrCorrupt, s.Version)
+	}
+	if s.Accounts == nil || s.Series == nil || s.Items == nil ||
+		s.Holdings == nil || s.Requests == nil {
+		return fmt.Errorf("%w: 快照内容不完整", ErrCorrupt)
+	}
+	if s.NextSeq < int64(len(s.History)) {
+		return fmt.Errorf("%w: 历史序号不连续", ErrCorrupt)
+	}
+	return nil
+}
+
+// store 负责一个登记册目录的加锁、读取与原子写入。
+type store struct {
+	dir  string
+	lock *os.File // 跨进程 flock
+}
+
+func dataFile(dir string) string { return filepath.Join(dir, "registry.json") }
+func lockFile(dir string) string { return filepath.Join(dir, "registry.lock") }
+func tempFile(dir string) string { return filepath.Join(dir, ".registry.json.tmp") }
+
+// acquireLock 在登记册目录中以非阻塞方式取独占 flock。
+func acquireLock(dir string) (*os.File, error) {
+	f, err := os.OpenFile(lockFile(dir), os.O_CREATE|os.O_RDWR, fileMode)
+	if err != nil {
+		return nil, fmt.Errorf("registry: 无法打开锁文件: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, ErrLocked
+		}
+		return nil, fmt.Errorf("registry: 无法锁定登记册: %w", err)
+	}
+	return f, nil
+}
+
+// load 读取快照。文件不存在时返回空快照；文件存在但无法读取或解析时
+// 返回 ErrCorrupt，绝不静默当成空登记册。
+func load(dir string) (*snapshot, error) {
+	b, err := os.ReadFile(dataFile(dir))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return newSnapshot(), nil
+		}
+		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	if len(b) == 0 {
+		return nil, fmt.Errorf("%w: 数据文件为空", ErrCorrupt)
+	}
+	var s snapshot
+	if err := json.Unmarshal(b, &s); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// save 以 temp 文件 + fsync + rename + 目录 fsync 的方式原子替换快照。
+// 在持有全局锁时调用：写入与状态修改在同一临界区，进程被杀时要么
+// 完整保留旧状态，要么完整呈现新状态。
+func (st *store) save(s *snapshot) error {
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("registry: 序列化失败: %w", err)
+	}
+	tmp := tempFile(st.dir)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fileMode)
+	if err != nil {
+		return fmt.Errorf("registry: 无法写入登记册: %w", err)
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(b); err != nil {
+		return fmt.Errorf("registry: 写入失败: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("registry: 落盘失败: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("registry: 关闭临时文件失败: %w", err)
+	}
+	if err := os.Rename(tmp, dataFile(st.dir)); err != nil {
+		return fmt.Errorf("registry: 替换数据文件失败: %w", err)
+	}
+	if dirFd, err := os.Open(st.dir); err == nil {
+		_ = dirFd.Sync()
+		dirFd.Close()
+	}
+	ok = true
+	return nil
+}
