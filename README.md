@@ -26,10 +26,20 @@ go test ./...
 - 转让 `Transfer`：当前持有人发起，接收人已登记、可用且不同于自己；
   必须给出期望持有人与期望版本，不符、藏品不存在或账户停用均明确拒绝，
   失败不改变持有、不产生历史。每次成功转让版本加 1。
+- 代转授权：当前持有人可为一件已发行藏品创建限时、一次性的代转授权
+  `CreateAuth`，指定唯一授权编号、受托账户、固定接收账户与绝对到期时间，
+  并提交期望持有人与版本。授权不改变持有关系，也不限制持有人继续直接
+  转让；同一藏品可有多份授权，各自绑定创建时的持有版本。受托人凭授权
+  发起代转 `DelegateTransfer`，只能操作其中指定的藏品与接收人；成功后
+  持有人变为接收人、版本加一，授权记为已使用并关联这笔转让。授权人可
+  撤销尚未使用的授权 `RevokeAuth`。创建、撤销与代转都带操作者、原因、
+  请求号，与发行、转让共用同一操作者的请求号范围；相同请求回放首次
+  结果，业务参数变化报请求号冲突，参数错误与引用不存在不占用请求号。
 - 查询：`GetAccount` / `GetSeries` / `GetItem` / `GetHolding` /
-  `HoldingsOf` / `History`。不存在的对象返回包裹 `ErrNotFound` 的错误；
-  历史按顺序包含发行与历次成功转让的操作者、原因、前后持有人与版本，
-  发行前的持有人与版本为空。
+  `HoldingsOf` / `History` / `GetAuth` / `AuthHistory`。不存在的对象返回
+  包裹 `ErrNotFound` 的错误；历史按顺序包含发行、历次成功转让与代转的
+  操作者、原因、前后持有人与版本，代转记录实际受托操作者并可追溯授权；
+  授权变更记录包含操作者、原因、请求号与前后状态。
 - 幂等：发行与转让都需要操作者、原因、请求号；同一操作者的请求号在两类
   操作间共用。相同业务参数重提返回首次的成功结果或业务拒绝（即使藏品后
   来已易手），任一参数改变返回 `ErrRequestConflict`，并发重复提交只生效
@@ -44,4 +54,4 @@ go test ./...
 业务错误均为哨兵（`errors.Is` 判定）：`ErrNotFound`、`ErrAlreadyExists`、
 `ErrAccountInactive`、`ErrSeriesSealed`、`ErrConflict`、`ErrSameAccount`、
 `ErrForbidden`、`ErrRequestConflict`、`ErrInvalidArgument`、`ErrCorrupt`、
-`ErrLocked`。
+`ErrLocked`、`ErrAuthRevoked`、`ErrAuthExpired`、`ErrAuthUsed`。

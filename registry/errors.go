@@ -32,6 +32,15 @@ var (
 	// ErrInvalidArgument 表示必填内容缺失或参数不合法。
 	ErrInvalidArgument = errors.New("registry: 参数不合法")
 
+	// ErrAuthRevoked 表示授权已被撤销，不能用于代转。
+	ErrAuthRevoked = errors.New("registry: 授权已撤销")
+
+	// ErrAuthExpired 表示授权已到期，不能用于代转。
+	ErrAuthExpired = errors.New("registry: 授权已到期")
+
+	// ErrAuthUsed 表示授权已被使用，不能再次代转。
+	ErrAuthUsed = errors.New("registry: 授权已使用")
+
 	// ErrCorrupt 表示登记册数据已存在但无法读取或解析。
 	ErrCorrupt = errors.New("registry: 登记册数据无法读取")
 

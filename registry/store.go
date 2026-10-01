@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // stateVersion 是快照格式的版本标记，未来不兼容变更时可据此识别。
@@ -17,18 +18,20 @@ const (
 	fileMode = 0o644
 )
 
-// snapshot 是登记册的全量落盘结构。账户、系列、藏品、持有、历史与
-// 请求结果都在同一个快照中，一次操作一次原子替换，保证"藏品已换人
-// 就一定有对应历史"。
+// snapshot 是登记册的全量落盘结构。账户、系列、藏品、持有、历史、授权、
+// 授权变更记录与请求结果都在同一个快照中，一次操作一次原子替换，保证
+// "藏品已换人就一定有对应历史"。
 type snapshot struct {
-	Version  int                `json:"version"`
-	Accounts map[string]account `json:"accounts"`
-	Series   map[string]series  `json:"series"`
-	Items    map[string]item    `json:"items"`
-	Holdings map[string]holding `json:"holdings"`
-	History  []historyEntry     `json:"history"`
-	Requests map[string]request `json:"requests"`
-	NextSeq  int64              `json:"next_seq"`
+	Version     int                `json:"version"`
+	Accounts    map[string]account `json:"accounts"`
+	Series      map[string]series  `json:"series"`
+	Items       map[string]item    `json:"items"`
+	Holdings    map[string]holding `json:"holdings"`
+	History     []historyEntry     `json:"history"`
+	Auths       map[string]auth    `json:"auths"`
+	AuthHistory []authEvent        `json:"auth_history"`
+	Requests    map[string]request `json:"requests"`
+	NextSeq     int64              `json:"next_seq"`
 }
 
 type account struct {
@@ -69,14 +72,51 @@ type historyEntry struct {
 	ToID        string `json:"to_id"`
 	FromVersion int64  `json:"from_version"`
 	ToVersion   int64  `json:"to_version"`
+	// AuthID 非空时表示这条转让是凭授权完成的代转。
+	AuthID string `json:"auth_id,omitempty"`
+}
+
+// auth 是一份限时、一次性代转授权的落盘结构。
+type auth struct {
+	ID         string    `json:"id"`
+	ItemID     string    `json:"item_id"`
+	Authorizer string    `json:"authorizer"`
+	Trustee    string    `json:"trustee"`
+	Receiver   string    `json:"receiver"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	HolderID   string    `json:"holder_id"`
+	Version    int64     `json:"version"`
+	Revoked    bool      `json:"revoked"`
+	Used       bool      `json:"used"`
+	UsedTxID   int64     `json:"used_tx_id,omitempty"`
+}
+
+// authState 是授权在某一时刻的状态，用于变更记录的前后对照。
+type authState struct {
+	Exists  bool `json:"exists"`
+	Revoked bool `json:"revoked"`
+	Used    bool `json:"used"`
+}
+
+// authEvent 是一条授权变更记录。
+type authEvent struct {
+	Seq       int64     `json:"seq"`
+	Kind      string    `json:"kind"` // "create" / "revoke" / "use"
+	AuthID    string    `json:"auth_id"`
+	ItemID    string    `json:"item_id"`
+	Operator  string    `json:"operator"`
+	Reason    string    `json:"reason"`
+	RequestID string    `json:"request_id"`
+	Before    authState `json:"before"`
+	After     authState `json:"after"`
 }
 
 // request 保存每个 (操作者, 请求号) 的首次结果，用于幂等回放。
-// 同一操作者的请求号在发行与转让两类操作间共用。
+// 同一操作者的请求号在发行、转让与代转授权操作间共用。
 type request struct {
 	Operator  string `json:"operator"`
 	RequestID string `json:"request_id"`
-	Kind      string `json:"kind"` // "issue" / "transfer"
+	Kind      string `json:"kind"` // "issue" / "transfer" / "create_auth" / "revoke_auth" / "delegate_transfer"
 	// 规范化后的业务参数签名。签名一致才回放；不一致报请求号冲突。
 	Params string `json:"params"`
 	// 业务拒绝也落盘：相同参数重提返回首次的拒绝。
@@ -84,6 +124,7 @@ type request struct {
 	Reason   string `json:"reject_reason"` // 哨兵错误对应的稳定标识
 	// 成功结果。
 	ItemID  string `json:"item_id,omitempty"`
+	AuthID  string `json:"auth_id,omitempty"`
 	FromID  string `json:"from_id,omitempty"`
 	ToID    string `json:"to_id,omitempty"`
 	Version int64  `json:"version,omitempty"`
@@ -97,6 +138,7 @@ func newSnapshot() *snapshot {
 		Series:   make(map[string]series),
 		Items:    make(map[string]item),
 		Holdings: make(map[string]holding),
+		Auths:    make(map[string]auth),
 		Requests: make(map[string]request),
 	}
 }
@@ -106,7 +148,7 @@ func (s *snapshot) validate() error {
 		return fmt.Errorf("%w: 不支持的快照版本 %d", ErrCorrupt, s.Version)
 	}
 	if s.Accounts == nil || s.Series == nil || s.Items == nil ||
-		s.Holdings == nil || s.Requests == nil {
+		s.Holdings == nil || s.Auths == nil || s.Requests == nil {
 		return fmt.Errorf("%w: 快照内容不完整", ErrCorrupt)
 	}
 	if s.NextSeq < int64(len(s.History)) {
@@ -157,6 +199,10 @@ func load(dir string) (*snapshot, error) {
 	var s snapshot
 	if err := json.Unmarshal(b, &s); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	// 兼容旧版本快照：旧数据没有授权相关字段，补空结构即可，原历史不变。
+	if s.Auths == nil {
+		s.Auths = make(map[string]auth)
 	}
 	if err := s.validate(); err != nil {
 		return nil, err

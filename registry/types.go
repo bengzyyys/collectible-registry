@@ -1,5 +1,7 @@
 package registry
 
+import "time"
+
 // Account 是账户登记信息。停用后仍可查询其原有藏品与历史。
 type Account struct {
 	ID       string // 唯一编号
@@ -47,6 +49,8 @@ type HistoryEntry struct {
 	FromVersion int64
 	// ToVersion 是转让后持有版本（发行后为 1）。
 	ToVersion int64
+	// AuthID 非空时表示这条转让是凭授权完成的代转。
+	AuthID string
 }
 
 // IssueRequest 是发行请求的业务参数（幂等判定以此为准）。
@@ -89,6 +93,104 @@ type TransferResult struct {
 	ToID     string // 转让后持有人
 	Version  int64  // 转让后版本
 	TxSeq    int64  // 转让历史序号
+	Replayed bool   // 是否为重复提交回放的首次结果
+	Err      error  // 业务拒绝；成功时为 nil
+}
+
+// ---- 代转授权 ----
+
+// Auth 是限时、一次性的代转授权。授权不改变持有关系，也不限制持有人
+// 继续直接转让；同一藏品可存在多份授权，各自绑定创建时的持有版本。
+type Auth struct {
+	ID         string    // 授权编号
+	ItemID     string    // 藏品编号
+	Authorizer string    // 授权人（创建时的当前持有人）
+	Trustee    string    // 受托人，唯一可发起代转的账户
+	Receiver   string    // 固定接收人
+	ExpiresAt  time.Time // 绝对到期时间；自该时间点起不可使用
+	HolderID   string    // 绑定的期望持有人
+	Version    int64     // 绑定的持有版本
+	Revoked    bool      // 是否已撤销
+	Used       bool      // 是否已使用
+	UsedTxID   int64     // 代转成功的历史序号；未使用为 0
+}
+
+// AuthState 是授权在某一时刻的状态，用于授权变更记录的前后对照。
+type AuthState struct {
+	Exists  bool // 授权是否已存在
+	Revoked bool // 是否已撤销
+	Used    bool // 是否已使用
+}
+
+// AuthHistoryEntry 是一条授权变更记录，按发生先后排列。
+type AuthHistoryEntry struct {
+	Seq       int64     // 严格递增的记录序号，也即发生顺序
+	Kind      string    // "create" / "revoke" / "use"
+	AuthID    string    // 授权编号
+	ItemID    string    // 藏品编号
+	Operator  string    // 操作者账户编号
+	Reason    string    // 操作原因
+	RequestID string    // 请求号
+	Before    AuthState // 变更前状态
+	After     AuthState // 变更后状态
+}
+
+// CreateAuthRequest 是创建代转授权的请求参数（幂等判定以此为准）。
+type CreateAuthRequest struct {
+	Operator      string    // 操作者，必须是当前持有人且可用（即授权人）
+	Reason        string    // 原因
+	RequestID     string    // 请求号，同一操作者在发行、转让、代转授权操作间共用
+	AuthID        string    // 唯一授权编号
+	ItemID        string    // 藏品编号
+	Trustee       string    // 受托人，必须已登记且可用
+	Receiver      string    // 固定接收人，必须已登记且可用
+	ExpiresAt     time.Time // 绝对到期时间，必须晚于当前时间
+	ExpectedOwner string    // 期望当前持有人
+	ExpectedVer   int64     // 期望当前持有版本
+}
+
+// CreateAuthResult 是创建代转授权请求的处理结果。
+type CreateAuthResult struct {
+	AuthID   string // 授权编号
+	ItemID   string // 藏品编号
+	Version  int64  // 绑定时的持有版本
+	TxSeq    int64  // 授权变更记录序号
+	Replayed bool   // 是否为重复提交回放的首次结果
+	Err      error  // 业务拒绝；成功时为 nil
+}
+
+// RevokeAuthRequest 是撤销代转授权的请求参数。
+type RevokeAuthRequest struct {
+	Operator  string // 操作者，必须是授权人
+	Reason    string // 原因
+	RequestID string // 请求号
+	AuthID    string // 授权编号
+}
+
+// RevokeAuthResult 是撤销代转授权请求的处理结果。
+type RevokeAuthResult struct {
+	AuthID   string // 授权编号
+	TxSeq    int64  // 本次撤销记录序号；幂等重放首次撤销的序号
+	Replayed bool   // 是否为重复提交回放的首次结果
+	Err      error  // 业务拒绝；成功时为 nil
+}
+
+// DelegateTransferRequest 是受托人凭授权发起代转的请求参数。
+type DelegateTransferRequest struct {
+	Operator  string // 操作者，必须是受托人
+	Reason    string // 原因
+	RequestID string // 请求号
+	AuthID    string // 授权编号
+}
+
+// DelegateTransferResult 是代转请求的处理结果。
+type DelegateTransferResult struct {
+	AuthID   string // 授权编号
+	ItemID   string // 藏品编号
+	FromID   string // 代转前持有人（授权人）
+	ToID     string // 代转后持有人（固定接收人）
+	Version  int64  // 代转后版本
+	TxSeq    int64  // 代转历史序号
 	Replayed bool   // 是否为重复提交回放的首次结果
 	Err      error  // 业务拒绝；成功时为 nil
 }
