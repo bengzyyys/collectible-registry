@@ -65,6 +65,42 @@ type IssueRequest struct {
 	HolderID  string // 初始持有人，必须是已登记且可用的账户
 }
 
+// IssueBatchEntry 是整批发行中一件藏品的提交内容。
+type IssueBatchEntry struct {
+	ItemID   string // 唯一藏品编号，清单内不能重复
+	Metadata string // 藏品文字元数据，可为空
+	HolderID string // 初始持有人，必须是已登记且可用的账户
+}
+
+// IssueBatchRequest 是整批发行请求的业务参数（幂等判定以此为准，含条目
+// 顺序）。整批共用操作者、原因、请求号、系列与批次号。
+type IssueBatchRequest struct {
+	Operator  string            // 操作者，必须是系列创建账户且可用
+	Reason    string            // 原因
+	RequestID string            // 请求号，与单件发行、转让等共用同一操作者的请求号范围
+	SeriesID  string            // 所属系列，整批同一系列
+	BatchNo   string            // 批次号，整批同一批次；不同请求可沿用同一批次号
+	Entries   []IssueBatchEntry // 发行清单，按提交顺序依次发行；不能为空
+}
+
+// IssueBatchItem 是整批发行中一件藏品的发行结果。
+type IssueBatchItem struct {
+	ItemID  string // 藏品编号
+	OwnerID string // 初始持有人
+	Version int64  // 持有版本，恒为 1
+	TxSeq   int64  // 发行历史序号；整批内连续递增
+}
+
+// IssueBatchResult 是整批发行请求的处理结果。
+type IssueBatchResult struct {
+	Items []IssueBatchItem // 各件的发行结果，按提交顺序排列；拒绝时为空
+	// ItemID 是业务拒绝所涉及的藏品编号（如编号已占用、初始持有人不可用的
+	// 那一件）；拒绝与具体某件无关时为空。
+	ItemID   string
+	Replayed bool  // 是否为重复提交回放的首次结果
+	Err      error // 首次或本次的业务拒绝；成功时为 nil
+}
+
 // TransferRequest 是转让请求的业务参数。
 type TransferRequest struct {
 	Operator      string // 操作者，必须是当前持有人且可用
