@@ -114,6 +114,47 @@ type TransferRequest struct {
 	Price int64
 }
 
+// TransferBatchEntry 是整批转让中一件藏品的提交内容。
+type TransferBatchEntry struct {
+	ItemID        string // 藏品编号，清单内不能重复
+	ToID          string // 接收账户，必须已登记、可用且不同于当前持有人；可与其他条目重复
+	ExpectedOwner string // 期望当前持有人，必须是整批操作者
+	ExpectedVer   int64  // 期望当前持有版本，必须为正整数
+	// Price 是成交价款，以分计，非负；未填按 0。负数按参数错误拒绝。
+	Price int64
+}
+
+// TransferBatchRequest 是整批转让请求的业务参数（幂等判定以此为准，含条目
+// 顺序）。整批共用操作者、原因与请求号；每件藏品分别转让给指定的接收账户。
+type TransferBatchRequest struct {
+	Operator  string               // 操作者，必须是每件藏品的当前持有人且可用
+	Reason    string               // 原因
+	RequestID string               // 请求号，与单件转让、发行等共用同一操作者的请求号范围
+	Entries   []TransferBatchEntry // 转让清单，按提交顺序依次执行；不能为空
+}
+
+// TransferBatchItem 是整批转让中一件藏品的转让结果。
+type TransferBatchItem struct {
+	ItemID    string           // 藏品编号
+	FromID    string           // 转让前持有人
+	ToID      string           // 转让后持有人
+	Version   int64            // 转让后持有版本
+	TxSeq     int64            // 转让历史序号；整批内连续递增
+	Price     int64            // 本笔成交价款（分）
+	Payables  []RoyaltyPayable // 各版税收款账户的应付明细（含零金额）
+	Remainder int64            // 扣除应付后归转让前持有人的余款
+}
+
+// TransferBatchResult 是整批转让请求的处理结果。
+type TransferBatchResult struct {
+	Items []TransferBatchItem // 各件的转让结果，按提交顺序排列；拒绝时为空
+	// ItemID 是业务拒绝所涉及的藏品编号（如期望版本不符、接收账户不可用的
+	// 那一件）；操作者账户本身的问题与具体某件无关时为空。
+	ItemID   string
+	Replayed bool  // 是否为重复提交回放的首次结果
+	Err      error // 首次或本次的业务拒绝；成功时为 nil
+}
+
 // IssueResult 是发行请求的处理结果。
 type IssueResult struct {
 	ItemID   string // 藏品编号
