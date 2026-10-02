@@ -32,9 +32,15 @@ type snapshot struct {
 	Authzs   map[string]authzRec `json:"authzs,omitempty"`
 	// AuthEvents 是按藏品记录的授权变更（创建/撤销/使用），在藏品
 	// 历史之外单独编号，不影响既有历史序号。
-	AuthEvents  []authzEvent `json:"auth_events,omitempty"`
-	NextSeq     int64        `json:"next_seq"`
-	NextAuthSeq int64        `json:"next_auth_seq,omitempty"`
+	AuthEvents []authzEvent `json:"auth_events,omitempty"`
+	// RoyaltyEvents 是按系列记录的版税规则设置/清空记录。
+	RoyaltyEvents []royaltyEvent `json:"royalty_events,omitempty"`
+	// RoyaltyRecords 是每次成功转让（含代转）的版税计算依据与应付明细，
+	// 按转让序号排列。旧版本数据不补造，查询时按零价款处理。
+	RoyaltyRecords []royaltyRecord `json:"royalty_records,omitempty"`
+	NextSeq        int64           `json:"next_seq"`
+	NextAuthSeq    int64           `json:"next_auth_seq,omitempty"`
+	NextRoyaltySeq int64           `json:"next_royalty_seq,omitempty"`
 }
 
 type account struct {
@@ -48,6 +54,49 @@ type series struct {
 	CreatorID string `json:"creator_id"`
 	Metadata  string `json:"metadata"`
 	Sealed    bool   `json:"sealed"`
+	// Royalty 是首次发行前设置的版税规则；为空表示不收版税。
+	Royalty *royaltyRule `json:"royalty,omitempty"`
+	// RoyaltyFixed 在系列首次成功发行后置为 true，此后规则不可更改。
+	RoyaltyFixed bool `json:"royalty_fixed,omitempty"`
+}
+
+// royaltyRule 是系列版税规则的落盘形式。
+type royaltyRule struct {
+	Entries []royaltyEntry `json:"entries"`
+}
+
+type royaltyEntry struct {
+	Account string `json:"account"`
+	Ratio   int    `json:"ratio"`
+}
+
+// royaltyEvent 是一次版税规则设置/清空记录。
+type royaltyEvent struct {
+	Seq        int64        `json:"seq"`
+	SeriesID   string       `json:"series_id"`
+	Operator   string       `json:"operator"`
+	Reason     string       `json:"reason"`
+	RequestID  string       `json:"request_id"`
+	FromRule   *royaltyRule `json:"from_rule,omitempty"`
+	ToRule     *royaltyRule `json:"to_rule,omitempty"`
+	OccurredAt time.Time    `json:"occurred_at"`
+}
+
+// royaltyRecord 是一次成功转让的版税计算依据与应付明细，与持有变化、
+// 历史在同一临界区内原子落盘。
+type royaltyRecord struct {
+	TxSeq     int64          `json:"tx_seq"`
+	ItemID    string         `json:"item_id"`
+	Price     int64          `json:"price"`     // 成交价款（分）
+	PayerID   string         `json:"payer_id"`  // 余款归属（转让前持有人）
+	Remainder int64          `json:"remainder"` // 价款扣除各收款人金额后的余款
+	Payees    []royaltyPayee `json:"payees,omitempty"`
+}
+
+type royaltyPayee struct {
+	Account string `json:"account"`
+	Ratio   int    `json:"ratio"`
+	Amount  int64  `json:"amount"`
 }
 
 type item struct {
@@ -90,6 +139,9 @@ type authzRec struct {
 	ToID      string    `json:"to_id"`
 	ExpiresAt time.Time `json:"expires_at"`
 	GrantVer  int64     `json:"grant_ver"`
+	// Price 是创建授权时确定的代转成交价款（分）；执行时不得更改，
+	// 旧版本数据写出的授权没有该字段，按零处理。
+	Price int64 `json:"price,omitempty"`
 	// Status 只记录非时间派生的终态："revoked" 或 "used"；为空表示
 	// 尚未终结，当前是否有效由到期时间实时判断。
 	Status    string    `json:"status,omitempty"`
@@ -115,23 +167,24 @@ type authzEvent struct {
 }
 
 // request 保存每个 (操作者, 请求号) 的首次结果，用于幂等回放。
-// 同一操作者的请求号在发行、转让、授权创建/撤销与代转之间共用。
+// 同一操作者的请求号在发行、转让、授权创建/撤销、代转与版税规则设置之间共用。
 type request struct {
 	Operator  string `json:"operator"`
 	RequestID string `json:"request_id"`
-	Kind      string `json:"kind"` // "issue" / "transfer" / "auth_create" / "auth_revoke" / "proxy_transfer"
+	Kind      string `json:"kind"` // "issue" / "transfer" / "auth_create" / "auth_revoke" / "proxy_transfer" / "royalty_set"
 	// 规范化后的业务参数签名。签名一致才回放；不一致报请求号冲突。
 	Params string `json:"params"`
 	// 业务拒绝也落盘：相同参数重提返回首次的拒绝。
 	Rejected bool   `json:"rejected"`
 	Reason   string `json:"reject_reason"` // 哨兵错误对应的稳定标识
 	// 成功结果。
-	ItemID  string `json:"item_id,omitempty"`
-	AuthID  string `json:"auth_id,omitempty"`
-	FromID  string `json:"from_id,omitempty"`
-	ToID    string `json:"to_id,omitempty"`
-	Version int64  `json:"version,omitempty"`
-	TxSeq   int64  `json:"tx_seq,omitempty"`
+	ItemID   string `json:"item_id,omitempty"`
+	AuthID   string `json:"auth_id,omitempty"`
+	SeriesID string `json:"series_id,omitempty"`
+	FromID   string `json:"from_id,omitempty"`
+	ToID     string `json:"to_id,omitempty"`
+	Version  int64  `json:"version,omitempty"`
+	TxSeq    int64  `json:"tx_seq,omitempty"`
 }
 
 func newSnapshot() *snapshot {
@@ -163,6 +216,17 @@ func (s *snapshot) validate() error {
 	}
 	if s.NextAuthSeq < int64(len(s.AuthEvents)) {
 		return fmt.Errorf("%w: 授权变更序号不连续", ErrCorrupt)
+	}
+	if s.NextRoyaltySeq < int64(len(s.RoyaltyEvents)) {
+		return fmt.Errorf("%w: 版税变更序号不连续", ErrCorrupt)
+	}
+	// 兼容旧版本写入的快照：旧数据没有版税固定标记，凡有藏品发行的系列
+	// 规则一律视为已固定（未设置即无版税），打开后不能再设置。
+	for _, it := range s.Items {
+		if ser, ok := s.Series[it.SeriesID]; ok && !ser.RoyaltyFixed {
+			ser.RoyaltyFixed = true
+			s.Series[it.SeriesID] = ser
+		}
 	}
 	return nil
 }

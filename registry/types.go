@@ -17,6 +17,56 @@ type Series struct {
 	Sealed    bool   // 是否已封存；封存不可撤销
 }
 
+// RoyaltyEntry 是一条版税规则中的收款条目：收款账户与分配比例。
+type RoyaltyEntry struct {
+	Account string // 收款账户编号，设置时必须已登记且可用
+	Ratio   int    // 比例，1 至 10000 的整数，单位为万分之一
+}
+
+// SeriesRoyalty 是系列当前版税规则的查询结果。
+type SeriesRoyalty struct {
+	SeriesID string         // 系列编号
+	Fixed    bool           // 规则是否已固定：首次成功发行后固定，不可再改
+	Entries  []RoyaltyEntry // 收款条目；为空表示不收版税
+}
+
+// RoyaltyEvent 是一次版税规则设置/清空记录，按发生先后排列。
+type RoyaltyEvent struct {
+	Seq        int64          // 严格递增的记录序号
+	SeriesID   string         // 系列编号
+	Operator   string         // 操作者账户编号（系列创建账户）
+	Reason     string         // 操作原因
+	RequestID  string         // 请求号
+	FromRule   []RoyaltyEntry // 变更前规则；为空表示此前无规则
+	ToRule     []RoyaltyEntry // 变更后规则；为空表示清空（不收版税）
+	OccurredAt time.Time      // 发生时间
+}
+
+// RoyaltyPayee 是一次转让中单个收款人的应付明细。
+type RoyaltyPayee struct {
+	Account string // 收款账户编号
+	Ratio   int    // 该笔转让适用的比例（万分之一）
+	Amount  int64  // 应付金额（分）：价款 * 比例 / 10000 向下取整
+}
+
+// TransferRoyalty 是一次转让的版税计算依据与全部金额。
+type TransferRoyalty struct {
+	TxSeq   int64          // 关联的转让历史序号
+	ItemID  string         // 藏品编号
+	Price   int64          // 成交价款（分），非负；未填为 0
+	PayerID string         // 余款归属账户，即转让前持有人（代转时为授权人，不是受托人）
+	Payees  []RoyaltyPayee // 各收款人应付明细；无版税规则时为空
+}
+
+// RoyaltyPayable 是按收款账户查看的一条应付明细。
+type RoyaltyPayable struct {
+	TxSeq  int64  // 关联的转让历史序号
+	ItemID string // 藏品编号
+	Ratio  int    // 适用比例（万分之一）
+	Price  int64  // 该笔转让的成交价款（分）
+	Amount int64  // 应付金额（分），向下取整；零金额也保留
+}
+
 // Item 是单件藏品的静态登记信息。
 type Item struct {
 	ID         string // 唯一藏品编号，同一编号不能产生第二件藏品
@@ -74,6 +124,7 @@ type TransferRequest struct {
 	ExpectedOwner string // 期望当前持有人（通常即发起人）
 	ExpectedVer   int64  // 期望当前持有版本
 	ToID          string // 接收人，必须已登记、可用且不同于当前持有人
+	Price         int64  // 成交价款（分），非负；未填按零，参与幂等判定
 }
 
 // IssueResult 是发行请求的处理结果。
@@ -122,6 +173,23 @@ type CreateAuthorizationRequest struct {
 	ExpectedOwner string    // 期望当前持有人
 	ExpectedVer   int64     // 期望当前持有版本；授权绑定该持有版本
 	ExpiresAt     time.Time // 绝对到期时间，必须晚于当前时间
+	Price         int64     // 代转成交价款（分），非负；创建时确定，执行时不得更改，参与幂等判定
+}
+
+// SetRoyaltyRequest 是系列版税规则设置/清空请求的业务参数（幂等判定以此为准）。
+type SetRoyaltyRequest struct {
+	Operator  string         // 操作者，必须是系列创建账户且可用
+	Reason    string         // 原因
+	RequestID string         // 请求号，与发行、转让、授权操作共用同一操作者的请求号范围
+	SeriesID  string         // 系列编号
+	Entries   []RoyaltyEntry // 收款条目；为空表示清空版税规则（不收版税）
+}
+
+// SetRoyaltyResult 是版税规则设置请求的处理结果。
+type SetRoyaltyResult struct {
+	SeriesID string
+	Replayed bool
+	Err      error
 }
 
 // RevokeAuthorizationRequest 是撤销授权的业务参数。

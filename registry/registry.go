@@ -337,6 +337,12 @@ func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 		Reason: req.Reason, RequestID: req.RequestID,
 		FromID: "", ToID: req.HolderID, FromVersion: 0, ToVersion: 1,
 	})
+	// 首次成功发行后系列版税规则固定：未设置即固定为无版税。
+	ser := r.state.Series[req.SeriesID]
+	if !ser.RoyaltyFixed {
+		ser.RoyaltyFixed = true
+		r.state.Series[req.SeriesID] = ser
+	}
 	r.state.Requests[key] = request{
 		Operator: req.Operator, RequestID: req.RequestID, Kind: "issue",
 		Params: sig, ItemID: req.ItemID, ToID: req.HolderID, Version: 1, TxSeq: seq,
@@ -420,6 +426,9 @@ func (req TransferRequest) validatePresent() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: 转让请求缺少必填字段 %s", ErrInvalidArgument, strings.Join(missing, ", "))
 	}
+	if req.Price < 0 {
+		return fmt.Errorf("%w: 成交价款不能为负数", ErrInvalidArgument)
+	}
 	return nil
 }
 
@@ -431,7 +440,8 @@ func transferParamsSig(req TransferRequest) string {
 		ExpectedVer   int64  `json:"expected_version"`
 		ToID          string `json:"to_id"`
 		Reason        string `json:"reason"`
-	}{"transfer", req.ItemID, req.ExpectedOwner, req.ExpectedVer, req.ToID, req.Reason})
+		Price         int64  `json:"price,omitempty"`
+	}{"transfer", req.ItemID, req.ExpectedOwner, req.ExpectedVer, req.ToID, req.Reason, req.Price})
 	return string(b)
 }
 
@@ -484,6 +494,9 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		Reason: req.Reason, RequestID: req.RequestID,
 		FromID: from, ToID: req.ToID, FromVersion: fromVer, ToVersion: fromVer + 1,
 	})
+	// 版税明细与持有变化、历史在同一临界区内一次落盘：余款归转让前持有人。
+	r.state.RoyaltyRecords = append(r.state.RoyaltyRecords,
+		r.buildRoyaltyRecord(seq, req.ItemID, from, req.Price, r.royaltyRuleForItem(req.ItemID)))
 	r.state.Requests[key] = request{
 		Operator: req.Operator, RequestID: req.RequestID, Kind: "transfer",
 		Params: sig, ItemID: req.ItemID, FromID: from, ToID: req.ToID,
@@ -596,6 +609,9 @@ func (req CreateAuthorizationRequest) validatePresent() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: 创建授权请求缺少必填字段 %s", ErrInvalidArgument, strings.Join(missing, ", "))
 	}
+	if req.Price < 0 {
+		return fmt.Errorf("%w: 代转成交价款不能为负数", ErrInvalidArgument)
+	}
 	return nil
 }
 
@@ -610,9 +626,10 @@ func createAuthzParamsSig(req CreateAuthorizationRequest) string {
 		ExpectedVer   int64  `json:"expected_version"`
 		ExpiresAt     string `json:"expires_at"`
 		Reason        string `json:"reason"`
+		Price         int64  `json:"price,omitempty"`
 	}{"auth_create", req.AuthID, req.ItemID, req.TrusteeID, req.ToID,
 		req.ExpectedOwner, req.ExpectedVer,
-		req.ExpiresAt.UTC().Format(time.RFC3339Nano), req.Reason})
+		req.ExpiresAt.UTC().Format(time.RFC3339Nano), req.Reason, req.Price})
 	return string(b)
 }
 
@@ -660,7 +677,7 @@ func (r *Registry) CreateAuthorization(req CreateAuthorizationRequest) (CreateAu
 	a := authzRec{
 		ID: req.AuthID, ItemID: req.ItemID, GranterID: req.Operator,
 		TrusteeID: req.TrusteeID, ToID: req.ToID, ExpiresAt: req.ExpiresAt,
-		GrantVer: h.Version, CreatedAt: now,
+		GrantVer: h.Version, CreatedAt: now, Price: req.Price,
 	}
 	r.state.Authzs[req.AuthID] = a
 	authSeq := r.state.NextAuthSeq + 1
@@ -943,6 +960,11 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 		FromID: from, ToID: a.ToID, FromVersion: fromVer, ToVersion: fromVer + 1,
 		AuthID: a.ID,
 	})
+	// 版税明细与持有变化、授权使用状态在同一临界区内一次落盘。价款以授权
+	// 创建时确定的为准，执行时不得改价；余款归转让前持有人（授权人），
+	// 不会记给受托人。
+	r.state.RoyaltyRecords = append(r.state.RoyaltyRecords,
+		r.buildRoyaltyRecord(seq, a.ItemID, from, a.Price, r.royaltyRuleForItem(a.ItemID)))
 	a.Status = "used"
 	a.UsedTxSeq = seq
 	a.UsedAt = now
