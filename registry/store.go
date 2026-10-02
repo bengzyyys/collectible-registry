@@ -171,7 +171,7 @@ type authzEvent struct {
 type request struct {
 	Operator  string `json:"operator"`
 	RequestID string `json:"request_id"`
-	Kind      string `json:"kind"` // "issue" / "transfer" / "auth_create" / "auth_revoke" / "proxy_transfer" / "royalty_set"
+	Kind      string `json:"kind"` // "issue" / "batch_issue" / "transfer" / "auth_create" / "auth_revoke" / "proxy_transfer" / "royalty_set"
 	// 规范化后的业务参数签名。签名一致才回放；不一致报请求号冲突。
 	Params string `json:"params"`
 	// 业务拒绝也落盘：相同参数重提返回首次的拒绝。
@@ -187,6 +187,16 @@ type request struct {
 	// SeriesID 与 Shares 记录版税规则设置的结果（本次生效的规则）。
 	SeriesID string         `json:"series_id,omitempty"`
 	Shares   []royaltyShare `json:"shares,omitempty"`
+	// BatchItems 记录整批发行每件的结果，用于幂等回放。
+	BatchItems []requestBatchItem `json:"batch_items,omitempty"`
+}
+
+// requestBatchItem 是整批发行中一件藏品的落盘结果。
+type requestBatchItem struct {
+	ItemID  string `json:"item_id"`
+	ToID    string `json:"to_id"`
+	Version int64  `json:"version"`
+	TxSeq   int64  `json:"tx_seq"`
 }
 
 func newSnapshot() *snapshot {
