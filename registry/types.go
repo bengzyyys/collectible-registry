@@ -365,3 +365,134 @@ type PayableEntry struct {
 	Rate   int64  // 计算所用比例（万分之一）
 	Amount int64  // 应付金额（分）
 }
+
+// ---- 藏品拆分意向 ----
+
+// 拆分意向生命周期状态。已失效与已过期不单独落盘，按当前状态与时间实时
+// 判断；已拒绝与已撤回是落盘的终态。
+const (
+	// SplitPending 表示意向已创建，尚有参与账户未答复。
+	SplitPending = "pending"
+	// SplitAgreed 表示全部参与账户已同意各自份额。
+	SplitAgreed = "agreed"
+	// SplitRejected 表示任一参与账户拒绝了自己的份额。
+	SplitRejected = "rejected"
+	// SplitWithdrawn 表示发起人已撤回意向。
+	SplitWithdrawn = "withdrawn"
+	// SplitInvalid 表示意向已失效：藏品持有版本已变化，或发起人、任一
+	// 参与账户已停用；藏品转回原持有人也不能恢复。
+	SplitInvalid = "invalid"
+	// SplitExpired 表示意向未失效但已过绝对到期时间。
+	SplitExpired = "expired"
+)
+
+// 参与账户的答复。
+const (
+	// SplitAnswerAgree 表示同意自己的份额。
+	SplitAnswerAgree = "agree"
+	// SplitAnswerReject 表示拒绝自己的份额。
+	SplitAnswerReject = "reject"
+)
+
+// SplitShare 是拆分意向中一个参与账户的份额。份额以万分之一为单位，
+// 每份 1..10000，全部份额合计必须为 10000。
+type SplitShare struct {
+	AccountID string // 参与账户，方案内不能重复
+	Share     int64  // 份额，万分之一，取值 1..10000
+}
+
+// CreateSplitIntentRequest 是创建拆分意向的业务参数（幂等判定以此为准；
+// 份额名单仅排列不同视为相同内容）。
+type CreateSplitIntentRequest struct {
+	Operator      string       // 操作者，必须是当前持有人（发起人）且可用
+	Reason        string       // 原因
+	RequestID     string       // 请求号，与发行、转让等共用同一操作者的请求号范围
+	IntentID      string       // 唯一意向编号
+	ItemID        string       // 已发行藏品编号
+	ExpectedOwner string       // 期望当前持有人
+	ExpectedVer   int64        // 期望当前持有版本；意向绑定该持有版本
+	ExpiresAt     time.Time    // 绝对到期时间，必须晚于当前时间
+	Shares        []SplitShare // 分配方案，至少两个账户；发起人可列入，其份额视为已同意
+}
+
+// AnswerSplitIntentRequest 是参与账户答复自己份额的业务参数。
+type AnswerSplitIntentRequest struct {
+	Operator  string // 操作者，必须是方案中的参与账户
+	Reason    string // 原因
+	RequestID string // 请求号
+	IntentID  string // 意向编号
+	Agree     bool   // true 同意，false 拒绝
+}
+
+// WithdrawSplitIntentRequest 是发起人撤回拆分意向的业务参数。
+type WithdrawSplitIntentRequest struct {
+	Operator  string // 操作者，必须是发起人
+	Reason    string // 原因
+	RequestID string // 请求号
+	IntentID  string // 意向编号
+}
+
+// SplitParty 是拆分意向中一个参与账户的份额与当前答复。
+type SplitParty struct {
+	AccountID string // 参与账户
+	Share     int64  // 份额，万分之一
+	// Answer 是该账户的当前答复：SplitAnswerAgree/SplitAnswerReject；
+	// 空表示尚未答复。发起人列入方案时创建即为 SplitAnswerAgree。
+	Answer string
+}
+
+// SplitIntent 是一份拆分意向的当前内容与状态。意向只记录未来拆分的
+// 约定，不改变藏品编号、持有人、持有版本与版税应付。
+type SplitIntent struct {
+	ID          string       // 意向编号
+	ItemID      string       // 藏品编号
+	InitiatorID string       // 发起人（创建时的持有人）
+	Shares      []SplitParty // 分配方案与各方答复（按账户排序）
+	GrantVer    int64        // 创建时绑定的持有版本
+	ExpiresAt   time.Time    // 绝对到期时间
+	Status      string       // 当前状态：SplitPending/SplitAgreed/SplitRejected/SplitWithdrawn/SplitInvalid/SplitExpired
+	CreatedAt   time.Time    // 创建时间
+	EndedAt     time.Time    // 拒绝或撤回时间；未终结为零值
+}
+
+// SplitIntentEvent 是拆分意向变更记录中的一条：创建、首次答复与撤回
+// 各记录一条，按发生先后排列。重复答复与重复撤回不新增记录。
+type SplitIntentEvent struct {
+	Seq        int64     // 意向变更记录内严格递增的序号
+	IntentID   string    // 意向编号
+	ItemID     string    // 藏品编号
+	Kind       string    // "create" / "answer" / "withdraw"
+	Operator   string    // 操作者账户编号
+	Reason     string    // 操作原因
+	RequestID  string    // 请求号
+	Answer     string    // answer 时的答复（agree/reject），否则为空
+	FromStatus string    // 变更前状态（create 前为空）
+	ToStatus   string    // 变更后状态
+	OccurredAt time.Time // 发生时间
+}
+
+// CreateSplitIntentResult 是创建拆分意向的结果。
+type CreateSplitIntentResult struct {
+	IntentID string
+	Status   string
+	GrantVer int64
+	Replayed bool
+	Err      error
+}
+
+// AnswerSplitIntentResult 是答复拆分意向的结果。Status 是答复生效后的
+// 意向状态。
+type AnswerSplitIntentResult struct {
+	IntentID string
+	Status   string
+	Replayed bool
+	Err      error
+}
+
+// WithdrawSplitIntentResult 是撤回拆分意向的结果。
+type WithdrawSplitIntentResult struct {
+	IntentID string
+	Status   string
+	Replayed bool
+	Err      error
+}

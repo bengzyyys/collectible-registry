@@ -41,6 +41,11 @@ type snapshot struct {
 	// RoyaltyEvents 是版税规则变更记录，单独编号。
 	RoyaltyEvents  []royaltyEvent `json:"royalty_events,omitempty"`
 	NextRoyaltySeq int64          `json:"next_royalty_seq,omitempty"`
+	// Intents 是拆分意向表；只记录未来拆分的约定，不影响持有与版税。
+	Intents map[string]intentRec `json:"intents,omitempty"`
+	// IntentEvents 是拆分意向变更记录（创建/首次答复/撤回），单独编号。
+	IntentEvents  []intentEvent `json:"intent_events,omitempty"`
+	NextIntentSeq int64         `json:"next_intent_seq,omitempty"`
 }
 
 type account struct {
@@ -165,13 +170,55 @@ type authzEvent struct {
 	OccurredAt time.Time `json:"occurred_at"`
 }
 
+// intentRec 是一份藏品拆分意向的落盘状态。意向在创建时绑定藏品当时的
+// 持有版本（GrantVer）；持有版本变化或发起人、任一参与账户停用后意向
+// 失效，且不因藏品转回原持有人而恢复。
+type intentRec struct {
+	ID          string        `json:"id"`
+	ItemID      string        `json:"item_id"`
+	InitiatorID string        `json:"initiator_id"`
+	Shares      []intentShare `json:"shares"` // 按账户排序的分配方案
+	GrantVer    int64         `json:"grant_ver"`
+	ExpiresAt   time.Time     `json:"expires_at"`
+	// Status 只记录非时间派生的终态："rejected" 或 "withdrawn"；为空表示
+	// 尚未终结，当前是否有效由持有版本、账户状态与到期时间实时判断。
+	Status    string    `json:"status,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+}
+
+// intentShare 是拆分意向中一个参与账户的份额与答复。
+type intentShare struct {
+	AccountID string `json:"account_id"`
+	Share     int64  `json:"share"`
+	// Answer 是该账户的答复："agree" / "reject"；空表示尚未答复。
+	// 发起人列入方案时创建即为 "agree"。
+	Answer string `json:"answer,omitempty"`
+}
+
+// intentEvent 是拆分意向变更记录：创建、首次答复、撤回各一条；重复答复
+// 与重复撤回不新增记录。
+type intentEvent struct {
+	Seq        int64     `json:"seq"`
+	IntentID   string    `json:"intent_id"`
+	ItemID     string    `json:"item_id"`
+	Kind       string    `json:"kind"` // "create" / "answer" / "withdraw"
+	Operator   string    `json:"operator"`
+	Reason     string    `json:"reason"`
+	RequestID  string    `json:"request_id"`
+	Answer     string    `json:"answer,omitempty"`
+	FromStatus string    `json:"from_status,omitempty"`
+	ToStatus   string    `json:"to_status"`
+	OccurredAt time.Time `json:"occurred_at"`
+}
+
 // request 保存每个 (操作者, 请求号) 的首次结果，用于幂等回放。
 // 同一操作者的请求号在发行、转让、授权创建/撤销、代转与版税规则设置
 // 之间共用。
 type request struct {
 	Operator  string `json:"operator"`
 	RequestID string `json:"request_id"`
-	Kind      string `json:"kind"` // "issue" / "issue_batch" / "transfer" / "transfer_batch" / "auth_create" / "auth_revoke" / "proxy_transfer" / "royalty_set"
+	Kind      string `json:"kind"` // "issue" / "issue_batch" / "transfer" / "transfer_batch" / "auth_create" / "auth_revoke" / "proxy_transfer" / "royalty_set" / "intent_create" / "intent_answer" / "intent_withdraw"
 	// 规范化后的业务参数签名。签名一致才回放；不一致报请求号冲突。
 	Params string `json:"params"`
 	// 业务拒绝也落盘：相同参数重提返回首次的拒绝。
@@ -184,6 +231,10 @@ type request struct {
 	ToID    string `json:"to_id,omitempty"`
 	Version int64  `json:"version,omitempty"`
 	TxSeq   int64  `json:"tx_seq,omitempty"`
+	// IntentID 与 Status 记录拆分意向类请求的结果（意向编号与操作后的
+	// 意向状态）。
+	IntentID string `json:"intent_id,omitempty"`
+	Status   string `json:"status,omitempty"`
 	// SeriesID 与 Shares 记录版税规则设置的结果（本次生效的规则）。
 	SeriesID string         `json:"series_id,omitempty"`
 	Shares   []royaltyShare `json:"shares,omitempty"`
@@ -222,6 +273,7 @@ func newSnapshot() *snapshot {
 		Requests:  make(map[string]request),
 		Authzs:    make(map[string]authzRec),
 		Royalties: make(map[int64]royaltyRec),
+		Intents:   make(map[string]intentRec),
 	}
 }
 
@@ -250,6 +302,13 @@ func (s *snapshot) validate() error {
 	}
 	if s.NextRoyaltySeq < int64(len(s.RoyaltyEvents)) {
 		return fmt.Errorf("%w: 版税规则变更序号不连续", ErrCorrupt)
+	}
+	if s.Intents == nil {
+		// 兼容旧版本写入的快照：拆分意向表按需惰性建立。
+		s.Intents = make(map[string]intentRec)
+	}
+	if s.NextIntentSeq < int64(len(s.IntentEvents)) {
+		return fmt.Errorf("%w: 拆分意向变更序号不连续", ErrCorrupt)
 	}
 	return nil
 }

@@ -42,6 +42,24 @@ var (
 	// 不能再设置或清空。
 	ErrRoyaltyFrozen = errors.New("registry: 版税规则已固定")
 
+	// ErrSplitIntentRejected 表示拆分意向已被参与账户拒绝，不再接受答复，
+	// 也不能撤回。
+	ErrSplitIntentRejected = errors.New("registry: 拆分意向已拒绝")
+
+	// ErrSplitIntentWithdrawn 表示拆分意向已被发起人撤回，不再接受答复。
+	ErrSplitIntentWithdrawn = errors.New("registry: 拆分意向已撤回")
+
+	// ErrSplitIntentInvalid 表示拆分意向已失效：藏品持有版本已变化，或
+	// 发起人、任一参与账户已停用；失效不可恢复。
+	ErrSplitIntentInvalid = errors.New("registry: 拆分意向已失效")
+
+	// ErrSplitIntentExpired 表示拆分意向已过绝对到期时间，从到期时间点
+	// 起不再接受答复或撤回。
+	ErrSplitIntentExpired = errors.New("registry: 拆分意向已过期")
+
+	// ErrSplitAnswered 表示参与账户已作出不同答复，不能改答。
+	ErrSplitAnswered = errors.New("registry: 已作出不同答复，不能改答")
+
 	// ErrRequestConflict 表示请求号已被同一操作者使用，但本次业务参数不同。
 	ErrRequestConflict = errors.New("registry: 请求号冲突")
 

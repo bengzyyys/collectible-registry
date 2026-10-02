@@ -109,19 +109,48 @@ go test ./...
     （active/revoked/expired/used，到期按当前时间实时判断）；
     `AuthorizationHistory` 按藏品查看创建、撤销、使用记录中的操作者、
     原因、请求号与前后状态。
+- 藏品拆分意向（只记录未来拆分的约定，不改变藏品编号、持有人、持有
+  版本与版税应付，既有发行、转让与代转功能不受影响）：
+  - `CreateSplitIntent`：当前持有人登记拆分意向，指定唯一意向编号、
+    藏品、期望持有人与版本、绝对到期时间，以及至少两个账户和各自
+    份额（万分之一整数，每份 1..10000，合计必须为 10000，账户不能
+    重复）。发起人与参与账户都须已登记且可用，到期时间须晚于当前
+    时间；发起人可以列入方案，其份额在创建时视为已同意。参数不合法
+    或对象不存在时拒绝且不占用请求号；编号已用、账户停用、持有版本
+    不符分别明确拒绝。系列封存不妨碍登记意向；藏品已有仍有效的待
+    确认或已达成意向时，新建按状态冲突（`ErrConflict`）拒绝。方案
+    创建后不能修改。
+  - `AnswerSplitIntent`：待确认或已达成且仍有效时，参与账户可同意
+    或拒绝自己的份额；全部同意显示已达成，任一拒绝显示已拒绝。
+    重复相同答复成功但不新增记录，改答拒绝（`ErrSplitAnswered`）；
+    名单外账户无权答复（`ErrForbidden`）。
+  - `WithdrawSplitIntent`：仅发起人可撤回仍有效的待确认或已达成
+    意向；已拒绝不能撤回，已撤回再次撤回成功但不增加记录（幂等）。
+  - 状态：待确认/已达成之外，已拒绝与已撤回是落盘终态，不再接受
+    答复；其余意向在藏品持有版本变化，或发起人、任一参与账户停用
+    后显示已失效（藏品转回原持有人也不能恢复），没有上述失效条件
+    时从到期时间点起显示已过期。已失效或已过期时拒绝答复及撤回并
+    说明原因；结束的意向仍可查询，并允许当前持有人用新编号另建
+    方案。
+  - 查询：`GetSplitIntent` 按编号查看方案、各方答复与当前状态；
+    `SplitIntentHistory` 按藏品查看意向历史（创建、首次答复、撤回
+    各记录意向编号、操作者、原因、请求号、时间与前后状态，按发生
+    顺序排列；重复答复与重复撤回不新增记录）。
 - 查询：`GetAccount` / `GetSeries` / `GetItem` / `GetHolding` /
   `HoldingsOf` / `History`。不存在的对象返回包裹 `ErrNotFound` 的错误；
   历史按顺序包含发行与历次成功转让（含代转）的操作者、原因、前后持有
   人与版本，发行前的持有人与版本为空。
-- 幂等：单件与整批发行、单件与整批转让、创建/撤销授权、代转与版税规则设置都需要
-  操作者、原因、请求号；同一操作者的请求号在全部操作间共用。相同业务参数重提
+- 幂等：单件与整批发行、单件与整批转让、创建/撤销授权、代转、版税规则设置与拆分意向的
+  创建/答复/撤回都需要操作者、原因、请求号；同一操作者的请求号在全部操作间共用。相同业务参数重提
   返回首次的成功结果或状态类业务拒绝（成功代转即使在到期、停用或再次
   易手后重提，仍返回原转让结果；成交价款与规则内容参与参数判定，改价
-  或改规则按请求号冲突拒绝），任一参数改变返回 `ErrRequestConflict`，
+  或改规则按请求号冲突拒绝；拆分意向仅调整份额名单排列视为相同内容），
+  任一参数改变返回 `ErrRequestConflict`，
   并发重复提交只生效一次。参数错误与引用不存在不占用请求号。
 - 持久化：每次操作在同一临界区内修改状态并以临时文件 + fsync + 原子
   rename 落盘，进程被直接终止后重开，登记、停用、封存、持有、授权、
-  授权变更记录、版税规则与应付明细、请求结果与历史都完整保留，不会
+  授权变更记录、版税规则与应付明细、拆分意向与意向变更记录、请求结果
+  与历史都完整保留，不会
   出现"已换人却没有对应历史"的中间状态。未收到结果的请求可用原请求号
   重试，返回已保存结果或完整执行一次。旧版本数据可直接打开，原历史
   不变，旧请求仍可回放，旧成交按价款 0 查询且不补造应付明细。
@@ -131,5 +160,7 @@ go test ./...
 业务错误均为哨兵（`errors.Is` 判定）：`ErrNotFound`、`ErrAlreadyExists`、
 `ErrAccountInactive`、`ErrSeriesSealed`、`ErrConflict`、`ErrSameAccount`、
 `ErrForbidden`、`ErrAuthorizationRevoked`、`ErrAuthorizationExpired`、
-`ErrAuthorizationUsed`、`ErrRoyaltyFrozen`、`ErrRequestConflict`、`ErrInvalidArgument`、
+`ErrAuthorizationUsed`、`ErrRoyaltyFrozen`、`ErrSplitIntentRejected`、
+`ErrSplitIntentWithdrawn`、`ErrSplitIntentInvalid`、`ErrSplitIntentExpired`、
+`ErrSplitAnswered`、`ErrRequestConflict`、`ErrInvalidArgument`、
 `ErrCorrupt`、`ErrLocked`。
