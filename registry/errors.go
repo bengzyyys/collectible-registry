@@ -38,6 +38,10 @@ var (
 	// 请求撤销）。
 	ErrAuthorizationUsed = errors.New("registry: 授权已使用")
 
+	// ErrRoyaltyFrozen 表示系列已成功发行首件藏品，版税规则已固定，
+	// 不能再设置或清空。
+	ErrRoyaltyFrozen = errors.New("registry: 版税规则已固定")
+
 	// ErrRequestConflict 表示请求号已被同一操作者使用，但本次业务参数不同。
 	ErrRequestConflict = errors.New("registry: 请求号冲突")
 

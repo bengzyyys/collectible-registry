@@ -74,6 +74,8 @@ type TransferRequest struct {
 	ExpectedOwner string // 期望当前持有人（通常即发起人）
 	ExpectedVer   int64  // 期望当前持有版本
 	ToID          string // 接收人，必须已登记、可用且不同于当前持有人
+	// Price 是成交价款，以分计，非负；未填按 0。负数按参数错误拒绝。
+	Price int64
 }
 
 // IssueResult 是发行请求的处理结果。
@@ -95,6 +97,11 @@ type TransferResult struct {
 	TxSeq    int64  // 转让历史序号
 	Replayed bool   // 是否为重复提交回放的首次结果
 	Err      error  // 业务拒绝；成功时为 nil
+	// Price 是本笔成交价款（分）；Payables 是各版税收款账户的应付明细
+	// （含零金额）；Remainder 是扣除应付后归转让前持有人的剩余收入。
+	Price     int64
+	Payables  []RoyaltyPayable
+	Remainder int64
 }
 
 // 授权生命周期状态。
@@ -122,6 +129,9 @@ type CreateAuthorizationRequest struct {
 	ExpectedOwner string    // 期望当前持有人
 	ExpectedVer   int64     // 期望当前持有版本；授权绑定该持有版本
 	ExpiresAt     time.Time // 绝对到期时间，必须晚于当前时间
+	// Price 是代转成交价款（分），在创建授权时确定，执行代转时不得改价；
+	// 非负，未填按 0。
+	Price int64
 }
 
 // RevokeAuthorizationRequest 是撤销授权的业务参数。
@@ -149,6 +159,8 @@ type Authorization struct {
 	ToID      string    // 固定接收账户
 	ExpiresAt time.Time // 绝对到期时间
 	GrantVer  int64     // 创建时绑定的持有版本
+	// Price 是创建时确定的代转成交价款（分）；旧登记册中的授权按 0。
+	Price     int64
 	Status    string    // 当前状态：AuthActive/AuthRevoked/AuthExpired/AuthUsed
 	UsedTxSeq int64     // 成功代转的历史序号；未使用为 0
 	UsedAt    time.Time // 成功代转时间；未使用为零值
@@ -200,4 +212,77 @@ type ProxyTransferResult struct {
 	TxSeq    int64  // 转让历史序号
 	Replayed bool   // 是否为重复提交回放的首次结果
 	Err      error  // 业务拒绝；成功时为 nil
+	// Price 是授权创建时确定的成交价款（分）；Payables 是各版税收款账户
+	// 的应付明细（含零金额）；Remainder 是归转让前持有人的剩余收入。
+	Price     int64
+	Payables  []RoyaltyPayable
+	Remainder int64
+}
+
+// ---- 版税规则与应付记录 ----
+
+// RoyaltyRateBase 是版税比例的分母：比例以万分之一为单位。
+const RoyaltyRateBase = 10000
+
+// RoyaltyShare 是版税规则中一个收款账户的份额。
+type RoyaltyShare struct {
+	AccountID string // 收款账户，规则内只能出现一次
+	Rate      int64  // 比例，万分之一，取值 1..10000；全部份额合计不超过 10000
+}
+
+// SetRoyaltyRequest 是设置或清空系列版税规则的业务参数（幂等判定以此
+// 为准）。Shares 为空表示清空规则，即不收版税。
+type SetRoyaltyRequest struct {
+	Operator  string         // 操作者，必须是系列创建账户且可用
+	Reason    string         // 原因
+	RequestID string         // 请求号，与发行、转让等共用同一操作者的请求号范围
+	SeriesID  string         // 系列编号
+	Shares    []RoyaltyShare // 新规则；空表示不收版税
+}
+
+// SetRoyaltyResult 是设置版税规则的结果。
+type SetRoyaltyResult struct {
+	SeriesID string         // 系列编号
+	Shares   []RoyaltyShare // 本次生效的规则（按收款账户排序规范化后）
+	Replayed bool           // 是否为重复提交回放的首次结果
+	Err      error          // 业务拒绝；成功时为 nil
+}
+
+// RoyaltyEvent 是一次版税规则变更记录，包含操作者、原因、请求号与前后
+// 内容；按发生先后排列。
+type RoyaltyEvent struct {
+	Seq        int64          // 规则变更记录内严格递增的序号
+	SeriesID   string         // 系列编号
+	Operator   string         // 操作者账户编号
+	Reason     string         // 操作原因
+	RequestID  string         // 请求号
+	Before     []RoyaltyShare // 变更前规则（首次设置前为空）
+	After      []RoyaltyShare // 变更后规则
+	OccurredAt time.Time      // 发生时间
+}
+
+// RoyaltyPayable 是一笔转让中某个版税收款账户的应付明细。
+type RoyaltyPayable struct {
+	AccountID string // 收款账户
+	Rate      int64  // 计算所用比例（万分之一）
+	Amount    int64  // 应付金额（分）：价款乘比例除以 10000 向下取整，零金额也保留
+}
+
+// TransferRoyalty 是一笔成功转让的版税计算依据与全部金额。
+type TransferRoyalty struct {
+	TxSeq     int64            // 转让历史序号
+	ItemID    string           // 藏品编号
+	Price     int64            // 成交价款（分）
+	Payables  []RoyaltyPayable // 各收款账户应付明细（含零金额；无规则时为空）
+	Remainder int64            // 扣除应付后的剩余收入，归转让前持有人
+	OwnerID   string           // 转让前持有人，即剩余收入的归属账户
+}
+
+// PayableEntry 是按收款账户查询时的一条应付明细。
+type PayableEntry struct {
+	TxSeq  int64  // 转让历史序号
+	ItemID string // 藏品编号
+	Price  int64  // 该笔成交价款（分）
+	Rate   int64  // 计算所用比例（万分之一）
+	Amount int64  // 应付金额（分）
 }

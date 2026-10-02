@@ -420,24 +420,33 @@ func (req TransferRequest) validatePresent() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: 转让请求缺少必填字段 %s", ErrInvalidArgument, strings.Join(missing, ", "))
 	}
+	if req.Price < 0 {
+		return fmt.Errorf("%w: 成交价款 %d 不能为负", ErrInvalidArgument, req.Price)
+	}
 	return nil
 }
 
 func transferParamsSig(req TransferRequest) string {
+	// Price 用 omitempty：价款为 0 时签名与引入价款前的旧格式一致，
+	// 旧登记册中落盘的请求仍可按原参数回放；改价则签名不同、按请求号
+	// 冲突拒绝。
 	b, _ := json.Marshal(struct {
 		Kind          string `json:"kind"`
 		ItemID        string `json:"item_id"`
 		ExpectedOwner string `json:"expected_owner"`
 		ExpectedVer   int64  `json:"expected_version"`
 		ToID          string `json:"to_id"`
+		Price         int64  `json:"price,omitempty"`
 		Reason        string `json:"reason"`
-	}{"transfer", req.ItemID, req.ExpectedOwner, req.ExpectedVer, req.ToID, req.Reason})
+	}{"transfer", req.ItemID, req.ExpectedOwner, req.ExpectedVer, req.ToID, req.Price, req.Reason})
 	return string(b)
 }
 
 // Transfer 由当前持有人发起转让。接收人必须已登记、可用且不同于当前
 // 持有人；请求必须给出期望持有人与期望版本，藏品不存在或持有人/版本
-// 不符时返回业务拒绝且不改变任何状态。同一 (操作者, 请求号) 的相同
+// 不符时返回业务拒绝且不改变任何状态。成交价款（分）由持有人填写，
+// 非负、未填按 0；成功时按所属系列的版税规则一次落盘各收款账户的
+// 应付明细与归转让前持有人的余款。同一 (操作者, 请求号) 的相同
 // 请求重复提交（即使藏品后来已易手）返回首次结果。
 func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 	if err := req.validatePresent(); err != nil {
@@ -484,6 +493,12 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		Reason: req.Reason, RequestID: req.RequestID,
 		FromID: from, ToID: req.ToID, FromVersion: fromVer, ToVersion: fromVer + 1,
 	})
+	// 版税应付与持有变化、历史、请求结果在同一临界区内一次落盘；
+	// 余款归转让前持有人。
+	it := r.state.Items[req.ItemID]
+	royalty := newRoyaltyRec(seq, req.ItemID, it.SeriesID, req.Price,
+		r.state.Series[it.SeriesID].Royalty, from)
+	r.state.Royalties[seq] = royalty
 	r.state.Requests[key] = request{
 		Operator: req.Operator, RequestID: req.RequestID, Kind: "transfer",
 		Params: sig, ItemID: req.ItemID, FromID: from, ToID: req.ToID,
@@ -493,7 +508,9 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		return TransferResult{}, err
 	}
 	return TransferResult{ItemID: req.ItemID, FromID: from, ToID: req.ToID,
-		Version: fromVer + 1, TxSeq: seq}, nil
+		Version: fromVer + 1, TxSeq: seq,
+		Price: royalty.Price, Payables: publicPayables(royalty.Payees),
+		Remainder: royalty.Remainder}, nil
 }
 
 func (r *Registry) checkTransfer(req TransferRequest) error {
@@ -541,6 +558,9 @@ func (r *Registry) replayTransfer(prev request, sig string) (TransferResult, err
 		res.Err = codeErr(prev.Reason)
 		return res, res.Err
 	}
+	// 回放首次成功的金额：即使藏品后来再次易手或进程重开，仍返回原
+	// 价款与应付明细，不重复计入。
+	res.Price, res.Payables, res.Remainder = r.royaltyOfTx(prev.TxSeq)
 	return res, nil
 }
 
@@ -596,10 +616,15 @@ func (req CreateAuthorizationRequest) validatePresent() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("%w: 创建授权请求缺少必填字段 %s", ErrInvalidArgument, strings.Join(missing, ", "))
 	}
+	if req.Price < 0 {
+		return fmt.Errorf("%w: 成交价款 %d 不能为负", ErrInvalidArgument, req.Price)
+	}
 	return nil
 }
 
 func createAuthzParamsSig(req CreateAuthorizationRequest) string {
+	// Price 用 omitempty：价款为 0 时签名与旧格式一致，旧授权创建请求
+	// 仍可回放；改价则按请求号冲突拒绝。
 	b, _ := json.Marshal(struct {
 		Kind          string `json:"kind"`
 		AuthID        string `json:"auth_id"`
@@ -609,10 +634,11 @@ func createAuthzParamsSig(req CreateAuthorizationRequest) string {
 		ExpectedOwner string `json:"expected_owner"`
 		ExpectedVer   int64  `json:"expected_version"`
 		ExpiresAt     string `json:"expires_at"`
+		Price         int64  `json:"price,omitempty"`
 		Reason        string `json:"reason"`
 	}{"auth_create", req.AuthID, req.ItemID, req.TrusteeID, req.ToID,
 		req.ExpectedOwner, req.ExpectedVer,
-		req.ExpiresAt.UTC().Format(time.RFC3339Nano), req.Reason})
+		req.ExpiresAt.UTC().Format(time.RFC3339Nano), req.Price, req.Reason})
 	return string(b)
 }
 
@@ -660,7 +686,7 @@ func (r *Registry) CreateAuthorization(req CreateAuthorizationRequest) (CreateAu
 	a := authzRec{
 		ID: req.AuthID, ItemID: req.ItemID, GranterID: req.Operator,
 		TrusteeID: req.TrusteeID, ToID: req.ToID, ExpiresAt: req.ExpiresAt,
-		GrantVer: h.Version, CreatedAt: now,
+		GrantVer: h.Version, Price: req.Price, CreatedAt: now,
 	}
 	r.state.Authzs[req.AuthID] = a
 	authSeq := r.state.NextAuthSeq + 1
@@ -943,6 +969,13 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 		FromID: from, ToID: a.ToID, FromVersion: fromVer, ToVersion: fromVer + 1,
 		AuthID: a.ID,
 	})
+	// 代转价款以授权创建时记载为准，执行时不得改价；余款归转让前持有
+	// 人（授权人），不记给受托人。应付明细与持有、历史、授权使用状态
+	// 在同一临界区内一次落盘。
+	it := r.state.Items[a.ItemID]
+	royalty := newRoyaltyRec(seq, a.ItemID, it.SeriesID, a.Price,
+		r.state.Series[it.SeriesID].Royalty, from)
+	r.state.Royalties[seq] = royalty
 	a.Status = "used"
 	a.UsedTxSeq = seq
 	a.UsedAt = now
@@ -963,7 +996,9 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 		return ProxyTransferResult{}, err
 	}
 	return ProxyTransferResult{AuthID: a.ID, ItemID: a.ItemID, FromID: from,
-		ToID: a.ToID, Version: fromVer + 1, TxSeq: seq}, nil
+		ToID: a.ToID, Version: fromVer + 1, TxSeq: seq,
+		Price: royalty.Price, Payables: publicPayables(royalty.Payees),
+		Remainder: royalty.Remainder}, nil
 }
 
 func (r *Registry) checkProxyTransfer(req ProxyTransferRequest, now time.Time) error {
@@ -1028,6 +1063,9 @@ func (r *Registry) replayProxyTransfer(prev request, sig string) (ProxyTransferR
 		res.Err = codeErr(prev.Reason)
 		return res, res.Err
 	}
+	// 回放首次成功的金额：授权到期、账户停用或藏品再次易手后仍返回
+	// 原价款与应付明细，不重复计入。
+	res.Price, res.Payables, res.Remainder = r.royaltyOfTx(prev.TxSeq)
 	return res, nil
 }
 
@@ -1048,7 +1086,7 @@ func (r *Registry) GetAuthorization(authID string) (Authorization, error) {
 	}
 	return Authorization{
 		ID: a.ID, ItemID: a.ItemID, GranterID: a.GranterID, TrusteeID: a.TrusteeID,
-		ToID: a.ToID, ExpiresAt: a.ExpiresAt, GrantVer: a.GrantVer,
+		ToID: a.ToID, ExpiresAt: a.ExpiresAt, GrantVer: a.GrantVer, Price: a.Price,
 		Status:    authzCurrentStatus(a, r.now()),
 		UsedTxSeq: a.UsedTxSeq, UsedAt: a.UsedAt, CreatedAt: a.CreatedAt,
 		RevokedAt: a.RevokedAt,
@@ -1186,6 +1224,7 @@ var errCodes = map[error]string{
 	ErrAuthorizationRevoked: "authorization_revoked",
 	ErrAuthorizationExpired: "authorization_expired",
 	ErrAuthorizationUsed:    "authorization_used",
+	ErrRoyaltyFrozen:        "royalty_frozen",
 }
 
 var codeErrs = map[string]error{
@@ -1199,6 +1238,7 @@ var codeErrs = map[string]error{
 	"authorization_revoked": ErrAuthorizationRevoked,
 	"authorization_expired": ErrAuthorizationExpired,
 	"authorization_used":    ErrAuthorizationUsed,
+	"royalty_frozen":        ErrRoyaltyFrozen,
 }
 
 func errCode(err error) string {
