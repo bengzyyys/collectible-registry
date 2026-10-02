@@ -365,3 +365,131 @@ type PayableEntry struct {
 	Rate   int64  // 计算所用比例（万分之一）
 	Amount int64  // 应付金额（分）
 }
+
+// ---- 藏品拆分意向 ----
+
+// 拆分意向生命周期状态。撤回与拒绝是落盘的终态；待确认、已达成、已失效
+// 与已过期按当前时间与登记状态实时判断。
+const (
+	// IntentionPending 表示意向已创建，尚有参与账户未答复。
+	IntentionPending = "pending"
+	// IntentionAgreed 表示全部参与账户均已同意。
+	IntentionAgreed = "agreed"
+	// IntentionRejected 表示任一参与账户拒绝了自己的份额，不再接受答复。
+	IntentionRejected = "rejected"
+	// IntentionWithdrawn 表示意向已被发起人撤回；撤回是幂等终态。
+	IntentionWithdrawn = "withdrawn"
+	// IntentionInvalid 表示藏品持有版本变化，或发起人、任一参与账户停用，
+	// 意向不可恢复。
+	IntentionInvalid = "invalid"
+	// IntentionExpired 表示没有失效条件时，意向已过绝对到期时间。
+	IntentionExpired = "expired"
+)
+
+// 意向答复内容。
+const (
+	// IntentionAnswerAgree 表示参与账户同意自己的份额。
+	IntentionAnswerAgree = "agree"
+	// IntentionAnswerReject 表示参与账户拒绝自己的份额。
+	IntentionAnswerReject = "reject"
+)
+
+// IntentionShare 是拆分意向中一个账户的期望份额。
+type IntentionShare struct {
+	AccountID string // 账户编号，名单内只能出现一次
+	Rate      int64  // 份额，万分之一，取值 1..10000；全部份额合计为 10000
+}
+
+// CreateIntentionRequest 是创建拆分意向的业务参数（幂等判定以此为准）。
+// 意向只保存未来拆分的约定，不改变藏品编号、持有人、持有版本与版税应付。
+type CreateIntentionRequest struct {
+	Operator      string           // 操作者，必须是当前持有人（发起人）且可用
+	Reason        string           // 原因
+	RequestID     string           // 请求号，与发行、转让等共用同一操作者的请求号范围
+	IntentionID   string           // 唯一意向编号
+	ItemID        string           // 已发行藏品编号
+	ExpectedOwner string           // 期望当前持有人
+	ExpectedVer   int64            // 期望当前持有版本
+	ExpiresAt     time.Time        // 绝对到期时间，必须晚于当前时间
+	Shares        []IntentionShare // 期望持有人与版本方案；至少两个账户，每份 1..10000，合计 10000
+}
+
+// CreateIntentionResult 是创建拆分意向的结果。
+type CreateIntentionResult struct {
+	IntentionID string
+	Status      string // 创建后状态：IntentionPending
+	Replayed    bool
+	Err         error
+}
+
+// RespondIntentionRequest 是参与账户答复自己份额的业务参数。
+type RespondIntentionRequest struct {
+	Operator    string // 答复账户，必须是份额名单内的参与账户
+	Reason      string // 原因
+	RequestID   string // 请求号
+	IntentionID string // 意向编号
+	Answer      string // IntentionAnswerAgree / IntentionAnswerReject
+}
+
+// RespondIntentionResult 是答复的结果。
+type RespondIntentionResult struct {
+	IntentionID string
+	Answer      string // 本次答复内容
+	Status      string // 答复后的意向状态
+	Replayed    bool
+	Err         error
+}
+
+// WithdrawIntentionRequest 是发起人撤回意向的业务参数。
+type WithdrawIntentionRequest struct {
+	Operator    string // 操作者，必须是发起人
+	Reason      string // 原因
+	RequestID   string // 请求号
+	IntentionID string // 意向编号
+}
+
+// WithdrawIntentionResult 是撤回的结果。
+type WithdrawIntentionResult struct {
+	IntentionID string
+	Status      string // 撤回后状态：IntentionWithdrawn
+	Replayed    bool
+	Err         error
+}
+
+// IntentionResponse 是份额名单中一个账户的答复情况。
+type IntentionResponse struct {
+	AccountID string // 账户编号
+	// Answer 是答复内容：IntentionAnswerAgree / IntentionAnswerReject；
+	// 空字符串表示尚未答复（发起人创建时视为同意）。
+	Answer string
+}
+
+// Intention 是一份拆分意向的当前内容与状态。
+type Intention struct {
+	ID            string              // 意向编号
+	ItemID        string              // 藏品编号
+	OperatorID    string              // 发起人（创建时的当前持有人）
+	ExpectedOwner string              // 期望当前持有人
+	ExpectedVer   int64               // 期望当前持有版本
+	ExpiresAt     time.Time           // 绝对到期时间
+	Shares        []IntentionShare    // 份额方案（按账户排序）
+	Responses     []IntentionResponse // 各方答复（按份额名单顺序）
+	Status        string              // 当前状态：IntentionPending/Agreed/Rejected/Withdrawn/Invalid/Expired
+	CreatedAt     time.Time           // 创建时间
+	WithdrawnAt   time.Time           // 撤回时间；未撤回为零值
+}
+
+// IntentionEvent 是一条意向变更记录：创建、答复或撤回，按发生先后排列。
+type IntentionEvent struct {
+	Seq         int64     // 意向变更记录内严格递增的序号
+	IntentionID string    // 意向编号
+	ItemID      string    // 藏品编号
+	Kind        string    // "create" / "respond" / "withdraw"
+	Operator    string    // 操作者账户编号（respond 时为答复账户）
+	Reason      string    // 操作原因
+	RequestID   string    // 请求号
+	Answer      string    // respond 时的答复内容；否则为空
+	FromStatus  string    // 变更前状态（create 前为空）
+	ToStatus    string    // 变更后状态
+	OccurredAt  time.Time // 发生时间
+}

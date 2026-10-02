@@ -45,6 +45,22 @@ var (
 	// ErrRequestConflict 表示请求号已被同一操作者使用，但本次业务参数不同。
 	ErrRequestConflict = errors.New("registry: 请求号冲突")
 
+	// ErrIntentionInvalid 表示拆分意向已失效：藏品持有版本变化，或发起人、
+	// 任一参与账户已停用；失效不可恢复。
+	ErrIntentionInvalid = errors.New("registry: 拆分意向已失效")
+
+	// ErrIntentionExpired 表示拆分意向已过绝对到期时间，从到期时间点起
+	// 不可再答复或撤回。
+	ErrIntentionExpired = errors.New("registry: 拆分意向已过期")
+
+	// ErrIntentionRejected 表示拆分意向已被任一参与账户拒绝，不再接受
+	// 答复或撤回。
+	ErrIntentionRejected = errors.New("registry: 拆分意向已拒绝")
+
+	// ErrIntentionWithdrawn 表示拆分意向已被发起人撤回；对答复而言是
+	// 拒绝，对撤回而言是幂等终态。
+	ErrIntentionWithdrawn = errors.New("registry: 拆分意向已撤回")
+
 	// ErrInvalidArgument 表示必填内容缺失或参数不合法。
 	ErrInvalidArgument = errors.New("registry: 参数不合法")
 

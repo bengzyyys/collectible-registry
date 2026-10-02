@@ -1225,6 +1225,10 @@ var errCodes = map[error]string{
 	ErrAuthorizationExpired: "authorization_expired",
 	ErrAuthorizationUsed:    "authorization_used",
 	ErrRoyaltyFrozen:        "royalty_frozen",
+	ErrIntentionInvalid:     "intention_invalid",
+	ErrIntentionExpired:     "intention_expired",
+	ErrIntentionRejected:    "intention_rejected",
+	ErrIntentionWithdrawn:   "intention_withdrawn",
 }
 
 var codeErrs = map[string]error{
@@ -1239,6 +1243,10 @@ var codeErrs = map[string]error{
 	"authorization_expired": ErrAuthorizationExpired,
 	"authorization_used":    ErrAuthorizationUsed,
 	"royalty_frozen":        ErrRoyaltyFrozen,
+	"intention_invalid":     ErrIntentionInvalid,
+	"intention_expired":     ErrIntentionExpired,
+	"intention_rejected":    ErrIntentionRejected,
+	"intention_withdrawn":   ErrIntentionWithdrawn,
 }
 
 func errCode(err error) string {
