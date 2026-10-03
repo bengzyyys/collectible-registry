@@ -480,37 +480,23 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		return TransferResult{ItemID: req.ItemID, Err: bizErr}, bizErr
 	}
 
-	h := r.state.Holdings[req.ItemID]
-	seq := r.state.NextSeq + 1
-	r.state.NextSeq = seq
-	from := h.OwnerID
-	fromVer := h.Version
-	h.OwnerID = req.ToID
-	h.Version = fromVer + 1
-	r.state.Holdings[req.ItemID] = h
-	r.state.History = append(r.state.History, historyEntry{
-		Seq: seq, Kind: "transfer", ItemID: req.ItemID, Operator: req.Operator,
-		Reason: req.Reason, RequestID: req.RequestID,
-		FromID: from, ToID: req.ToID, FromVersion: fromVer, ToVersion: fromVer + 1,
+	// 持有变化、历史、版税应付与请求结果在同一临界区内一次落盘：直接
+	// 转让不关联授权，AuthID 为空。
+	done := r.applyTransfer(transferMove{
+		ItemID: req.ItemID, ToID: req.ToID, Operator: req.Operator,
+		Reason: req.Reason, RequestID: req.RequestID, Price: req.Price,
 	})
-	// 版税应付与持有变化、历史、请求结果在同一临界区内一次落盘；
-	// 余款归转让前持有人。
-	it := r.state.Items[req.ItemID]
-	royalty := newRoyaltyRec(seq, req.ItemID, it.SeriesID, req.Price,
-		r.state.Series[it.SeriesID].Royalty, from)
-	r.state.Royalties[seq] = royalty
 	r.state.Requests[key] = request{
 		Operator: req.Operator, RequestID: req.RequestID, Kind: "transfer",
-		Params: sig, ItemID: req.ItemID, FromID: from, ToID: req.ToID,
-		Version: fromVer + 1, TxSeq: seq,
+		Params: sig, ItemID: done.ItemID, FromID: done.FromID, ToID: done.ToID,
+		Version: done.Version, TxSeq: done.TxSeq,
 	}
 	if err := r.commit(); err != nil {
 		return TransferResult{}, err
 	}
-	return TransferResult{ItemID: req.ItemID, FromID: from, ToID: req.ToID,
-		Version: fromVer + 1, TxSeq: seq,
-		Price: royalty.Price, Payables: publicPayables(royalty.Payees),
-		Remainder: royalty.Remainder}, nil
+	return TransferResult{ItemID: done.ItemID, FromID: done.FromID, ToID: done.ToID,
+		Version: done.Version, TxSeq: done.TxSeq,
+		Price: done.Price, Payables: done.Payables, Remainder: done.Remainder}, nil
 }
 
 func (r *Registry) checkTransfer(req TransferRequest) error {
@@ -955,29 +941,19 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 	}
 
 	a := r.state.Authzs[req.AuthID]
-	h := r.state.Holdings[a.ItemID]
-	seq := r.state.NextSeq + 1
-	r.state.NextSeq = seq
-	from := h.OwnerID
-	fromVer := h.Version
-	h.OwnerID = a.ToID
-	h.Version = fromVer + 1
-	r.state.Holdings[a.ItemID] = h
-	r.state.History = append(r.state.History, historyEntry{
-		Seq: seq, Kind: "transfer", ItemID: a.ItemID, Operator: req.Operator,
-		Reason: req.Reason, RequestID: req.RequestID,
-		FromID: from, ToID: a.ToID, FromVersion: fromVer, ToVersion: fromVer + 1,
+	// 持有、历史与版税应付与直接转让走同一套落盘逻辑：操作者是受托账户，
+	// 历史通过 AuthID 追溯本授权，价款以授权创建时写定的金额为准，余款归
+	// 转让前持有人（授权人）。
+	done := r.applyTransfer(transferMove{
+		ItemID: a.ItemID, ToID: a.ToID, Operator: req.Operator,
+		Reason: req.Reason, RequestID: req.RequestID, Price: a.Price,
 		AuthID: a.ID,
 	})
-	// 代转价款以授权创建时记载为准，执行时不得改价；余款归转让前持有
-	// 人（授权人），不记给受托人。应付明细与持有、历史、授权使用状态
-	// 在同一临界区内一次落盘。
-	it := r.state.Items[a.ItemID]
-	royalty := newRoyaltyRec(seq, a.ItemID, it.SeriesID, a.Price,
-		r.state.Series[it.SeriesID].Royalty, from)
-	r.state.Royalties[seq] = royalty
+	// 只有实际执行代转才把授权记为已使用并关联本次转让；直接转让与整批
+	// 转让不经过这里，不会替本授权消耗。授权使用状态与持有、历史、应付、
+	// 请求结果在同一临界区内一次落盘。
 	a.Status = "used"
-	a.UsedTxSeq = seq
+	a.UsedTxSeq = done.TxSeq
 	a.UsedAt = now
 	r.state.Authzs[a.ID] = a
 	authSeq := r.state.NextAuthSeq + 1
@@ -985,20 +961,19 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 	r.state.AuthEvents = append(r.state.AuthEvents, authzEvent{
 		Seq: authSeq, AuthID: a.ID, ItemID: a.ItemID, Kind: "use",
 		Operator: req.Operator, Reason: req.Reason, RequestID: req.RequestID,
-		FromStatus: AuthActive, ToStatus: AuthUsed, TxSeq: seq, OccurredAt: now,
+		FromStatus: AuthActive, ToStatus: AuthUsed, TxSeq: done.TxSeq, OccurredAt: now,
 	})
 	r.state.Requests[key] = request{
 		Operator: req.Operator, RequestID: req.RequestID, Kind: "proxy_transfer",
-		Params: sig, AuthID: a.ID, ItemID: a.ItemID, FromID: from, ToID: a.ToID,
-		Version: fromVer + 1, TxSeq: seq,
+		Params: sig, AuthID: a.ID, ItemID: done.ItemID, FromID: done.FromID,
+		ToID: done.ToID, Version: done.Version, TxSeq: done.TxSeq,
 	}
 	if err := r.commit(); err != nil {
 		return ProxyTransferResult{}, err
 	}
-	return ProxyTransferResult{AuthID: a.ID, ItemID: a.ItemID, FromID: from,
-		ToID: a.ToID, Version: fromVer + 1, TxSeq: seq,
-		Price: royalty.Price, Payables: publicPayables(royalty.Payees),
-		Remainder: royalty.Remainder}, nil
+	return ProxyTransferResult{AuthID: a.ID, ItemID: done.ItemID, FromID: done.FromID,
+		ToID: done.ToID, Version: done.Version, TxSeq: done.TxSeq,
+		Price: done.Price, Payables: done.Payables, Remainder: done.Remainder}, nil
 }
 
 func (r *Registry) checkProxyTransfer(req ProxyTransferRequest, now time.Time) error {
