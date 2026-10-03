@@ -137,36 +137,20 @@ func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult,
 
 	// 在同一临界区内按清单顺序依次转让：各件版本分别加一、历史序号连续，
 	// 与其他整批、单件转让、代转或发行互斥，整批记录之间不会插入别的记录。
+	// 各件沿用与单件转让相同的持有、历史与版税落盘逻辑；同一收款账户在
+	// 多件中出现也各自落盘明细，价款不合并。
 	items := make([]TransferBatchItem, 0, len(req.Entries))
 	stored := make([]batchTransferItemResult, 0, len(req.Entries))
 	for _, e := range req.Entries {
-		h := r.state.Holdings[e.ItemID]
-		seq := r.state.NextSeq + 1
-		r.state.NextSeq = seq
-		from := h.OwnerID
-		fromVer := h.Version
-		h.OwnerID = e.ToID
-		h.Version = fromVer + 1
-		r.state.Holdings[e.ItemID] = h
-		r.state.History = append(r.state.History, historyEntry{
-			Seq: seq, Kind: "transfer", ItemID: e.ItemID, Operator: req.Operator,
-			Reason: req.Reason, RequestID: req.RequestID,
-			FromID: from, ToID: e.ToID, FromVersion: fromVer, ToVersion: fromVer + 1,
-		})
-		// 版税按各件所属系列的固定规则快照分别计算；同一收款账户在多件中
-		// 出现也各自落盘明细，价款不合并。
-		it := r.state.Items[e.ItemID]
-		royalty := newRoyaltyRec(seq, e.ItemID, it.SeriesID, e.Price,
-			r.state.Series[it.SeriesID].Royalty, from)
-		r.state.Royalties[seq] = royalty
+		out := r.applyTransfer(e.ItemID, e.ToID, req.Operator, req.Reason, req.RequestID, "", e.Price)
 		items = append(items, TransferBatchItem{
-			ItemID: e.ItemID, FromID: from, ToID: e.ToID, Version: fromVer + 1,
-			TxSeq: seq, Price: royalty.Price, Payables: publicPayables(royalty.Payees),
-			Remainder: royalty.Remainder,
+			ItemID: e.ItemID, FromID: out.fromID, ToID: e.ToID, Version: out.toVer(),
+			TxSeq: out.seq, Price: out.royalty.Price, Payables: publicPayables(out.royalty.Payees),
+			Remainder: out.royalty.Remainder,
 		})
 		stored = append(stored, batchTransferItemResult{
-			ItemID: e.ItemID, FromID: from, ToID: e.ToID,
-			Version: fromVer + 1, TxSeq: seq,
+			ItemID: e.ItemID, FromID: out.fromID, ToID: e.ToID,
+			Version: out.toVer(), TxSeq: out.seq,
 		})
 	}
 	// 持有变化、历史、应付与请求结果在同一临界区内一次落盘：保存失败时
