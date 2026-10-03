@@ -1200,8 +1200,14 @@ func (r *Registry) History(itemID string) ([]HistoryEntry, error) {
 
 // ---- 幂等辅助 ----
 
+// requestKey 由完整的操作者账户编号与完整的请求号共同确定一条请求记录。
+// 采用 JSON 数组编码而非直接拼接：账户编号或请求号本身允许包含零字符
+// （U+0000）等任意字符，直接拼接会让 ("a", "b\x00c") 与 ("a\x00b", "c")
+// 之类不同的组合得到相同的键，导致不同账户互相占用请求号、回放别人的
+// 结果。JSON 编码对任意字符都无歧义，两个组成部分各自完整参与键的构成。
 func requestKey(operator, requestID string) string {
-	return operator + "\x00" + requestID
+	b, _ := json.Marshal([2]string{operator, requestID})
+	return string(b)
 }
 
 // isValidationErr 判定是否为请求本身不成立的错误：必填缺失，或引用了

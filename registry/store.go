@@ -310,7 +310,22 @@ func (s *snapshot) validate() error {
 	if s.NextIntentSeq < int64(len(s.IntentEvents)) {
 		return fmt.Errorf("%w: 拆分意向变更序号不连续", ErrCorrupt)
 	}
+	s.rekeyRequests()
 	return nil
+}
+
+// rekeyRequests 按每条请求记录自身保存的完整操作者账户编号与请求号重建
+// 请求表的键。旧版本快照的键由账户编号与请求号直接拼接而成，含零字符
+// （U+0000）时不同账户的不同请求会得到相同的键；落盘记录本身始终保存
+// 真实的提交账户与请求号，据此重建后旧请求仍归原提交账户所有，使用原
+// 参数即可回放原结果，碰巧混淆的另一组编号也不会占用或覆盖原请求。
+// 该重建对任意字符组合都是幂等的，每次加载都执行。
+func (s *snapshot) rekeyRequests() {
+	reqs := make(map[string]request, len(s.Requests))
+	for _, req := range s.Requests {
+		reqs[requestKey(req.Operator, req.RequestID)] = req
+	}
+	s.Requests = reqs
 }
 
 // store 负责一个登记册目录的加锁、读取与原子写入。
