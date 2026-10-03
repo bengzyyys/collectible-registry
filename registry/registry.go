@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1200,8 +1201,14 @@ func (r *Registry) History(itemID string) ([]HistoryEntry, error) {
 
 // ---- 幂等辅助 ----
 
+// requestKey 返回 (操作者账户编号, 请求号) 的无歧义拼接键。账户编号与
+// 请求号都允许包含任意字符（包括 NUL，即 U+0000），因此不能直接用 NUL
+// 拼接："a" + NUL + "b\x00c" 与 "a\x00b" + NUL + "c" 会得到同一串，
+// 使不同账户的请求互相占用请求号甚至互相回放。这里在两段前各加十进制
+// 长度前缀再用 NUL 分隔：解析时长度唯一确定边界，任何字符（包括 NUL 与
+// 数字）都不会造成歧义。
 func requestKey(operator, requestID string) string {
-	return operator + "\x00" + requestID
+	return strconv.Itoa(len(operator)) + "\x00" + strconv.Itoa(len(requestID)) + "\x00" + operator + requestID
 }
 
 // isValidationErr 判定是否为请求本身不成立的错误：必填缺失，或引用了

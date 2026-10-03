@@ -22,14 +22,21 @@ const (
 // 授权、授权变更记录与请求结果都在同一个快照中，一次操作一次原子
 // 替换，保证"藏品已换人就一定有对应历史"。
 type snapshot struct {
-	Version  int                 `json:"version"`
-	Accounts map[string]account  `json:"accounts"`
-	Series   map[string]series   `json:"series"`
-	Items    map[string]item     `json:"items"`
-	Holdings map[string]holding  `json:"holdings"`
-	History  []historyEntry      `json:"history"`
-	Requests map[string]request  `json:"requests"`
-	Authzs   map[string]authzRec `json:"authzs,omitempty"`
+	Version  int                `json:"version"`
+	Accounts map[string]account `json:"accounts"`
+	Series   map[string]series  `json:"series"`
+	Items    map[string]item    `json:"items"`
+	Holdings map[string]holding `json:"holdings"`
+	History  []historyEntry     `json:"history"`
+	// Requests 以无歧义编码的 (操作者账户编号, 请求号) 为键（编码见
+	// requestKey），保存每个请求的首次结果用于幂等回放。
+	Requests map[string]request `json:"requests_v2"`
+	// LegacyRequests 只用于读取修复前的快照：旧键直接用单个 NUL 拼接
+	// 操作者与请求号，编号自身含 NUL 时会把不同账户的请求混成同一键。
+	// 载入时在 migrateRequests 中按记录内完整的 operator/request_id
+	// 重建为 Requests；该字段不再写出。
+	LegacyRequests map[string]request  `json:"requests,omitempty"`
+	Authzs         map[string]authzRec `json:"authzs,omitempty"`
 	// AuthEvents 是按藏品记录的授权变更（创建/撤销/使用），在藏品
 	// 历史之外单独编号，不影响既有历史序号。
 	AuthEvents  []authzEvent `json:"auth_events,omitempty"`
@@ -281,6 +288,7 @@ func (s *snapshot) validate() error {
 	if s.Version != stateVersion {
 		return fmt.Errorf("%w: 不支持的快照版本 %d", ErrCorrupt, s.Version)
 	}
+	s.migrateRequests()
 	if s.Accounts == nil || s.Series == nil || s.Items == nil ||
 		s.Holdings == nil || s.Requests == nil {
 		return fmt.Errorf("%w: 快照内容不完整", ErrCorrupt)
@@ -311,6 +319,41 @@ func (s *snapshot) validate() error {
 		return fmt.Errorf("%w: 拆分意向变更序号不连续", ErrCorrupt)
 	}
 	return nil
+}
+
+// migrateRequests 把修复前的请求表迁移到无歧义的新键。旧键用单个 NUL
+// 直接拼接操作者与请求号：操作者 "a"、请求号 "b\x00c" 与操作者
+// "a\x00b"、请求号 "c" 会得到同一个旧键，造成不同账户互相占用请求号、
+// 甚至回放别人的结果。记录内始终完整保存着各自的 operator 与
+// request_id（原样保留 NUL），因此按记录自身字段重算 requestKey 即可把
+// 旧键下混在一起的请求拆回各自的 (账户, 请求号)；两个无歧义新键不会
+// 再冲突。迁移只在内存中重建索引，不改动任何业务状态：藏品、持有、
+// 历史、应付与各请求记录本身都保持原样。
+func (s *snapshot) migrateRequests() {
+	if len(s.LegacyRequests) == 0 {
+		if s.Requests == nil {
+			s.Requests = make(map[string]request)
+		}
+		s.LegacyRequests = nil
+		return
+	}
+	migrated := make(map[string]request, len(s.LegacyRequests))
+	for _, rec := range s.LegacyRequests {
+		// 以记录内完整字段为准重算键；NUL 等字符原样参与、不删除不替换。
+		migrated[requestKey(rec.Operator, rec.RequestID)] = rec
+	}
+	if len(s.Requests) > 0 {
+		// 正常情况下同一快照只会存在一种请求表；若新表中已有记录则保留，
+		// 仅补上旧表中不与新键重合的条目，二者的新键都无歧义。
+		for k, rec := range migrated {
+			if _, exists := s.Requests[k]; !exists {
+				s.Requests[k] = rec
+			}
+		}
+	} else {
+		s.Requests = migrated
+	}
+	s.LegacyRequests = nil
 }
 
 // store 负责一个登记册目录的加锁、读取与原子写入。
