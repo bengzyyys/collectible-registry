@@ -464,6 +464,13 @@ func (r *Registry) applyTransfer(itemID, toID, operator, reason, requestID, auth
 // 非负、未填按 0；成功时按所属系列的版税规则一次落盘各收款账户的
 // 应付明细与归转让前持有人的余款。同一 (操作者, 请求号) 的相同
 // 请求重复提交（即使藏品后来已易手）返回首次结果。
+//
+// 状态类拒绝的落盘失败时，与整批转让一致：返回保存错误（保留实际写入
+// 错误）而非该业务错误，结果为空（无藏品编号、无持有变化、无历史序号、
+// 无金额、业务错误为空、不标回放），请求号不被这次未保存的拒绝占用；
+// 保存条件恢复后用完全相同的请求重提，按当时的业务状态重新判断：拒绝
+// 条件仍在则重新保存此次拒绝并返回对应业务错误，状态已变为满足请求则
+// 正常转出。
 func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return TransferResult{}, err
@@ -490,7 +497,18 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 				Params: sig, Rejected: true, Reason: errCode(bizErr),
 				ItemID: req.ItemID,
 			}
-			_ = r.commit()
+			if err := r.commit(); err != nil {
+				// 拒绝结果落盘失败：这次拒绝没有被记住，与整批转让一致——
+				// 不能只用业务错误掩盖保存错误，调用者稍后用原请求重提时
+				// 必须按当时状态重新判断，而不是回放一个实际没有保存的
+				// 拒绝。commit 失败时已按磁盘内容重建状态，请求记录随之
+				// 撤销；此处再删一次以覆盖磁盘暂时不可读、状态未能重建
+				// 的情形。整体返回空结果：无藏品编号、无持有变化、无历史
+				// 序号、无金额、不标回放、结果中业务错误为空，error 保留
+				// 实际写入错误。
+				delete(r.state.Requests, key)
+				return TransferResult{}, err
+			}
 		}
 		// 藏品或账户不存在等校验错误不占用请求号，也不改变持有或历史。
 		return TransferResult{ItemID: req.ItemID, Err: bizErr}, bizErr
