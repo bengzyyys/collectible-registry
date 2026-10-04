@@ -88,6 +88,15 @@ func issueBatchParamsSig(req IssueBatchRequest) string {
 // ErrRequestConflict。成功回放仍给出最初的发行结果，即使藏品已转走、
 // 系列已封存或账户已停用。参数错误与引用不存在不占用请求号，修正后可
 // 用原号重新提交。
+//
+// 状态类拒绝的落盘失败时，返回保存错误（保留实际写入错误）而非该业务
+// 错误，结果为空（无发行结果、无失败藏品编号、不标回放、业务错误为空），
+// 请求号不被这次未保存的拒绝占用；同一已打开登记册上不留下这次请求的
+// 拒绝记录，任何藏品都不新增登记、持有或发行历史，未使用的编号不被
+// 占用，历史序号不被消耗，尚未首次发行的系列也不因此固定版税规则。
+// 保存条件恢复后用完全相同的请求重提，按当时的业务状态重新判断：拒绝
+// 条件仍在则重新保存此次拒绝并返回对应业务错误（此次不算回放），状态
+// 已变为满足请求则整批正常发行。
 func (r *Registry) IssueBatch(req IssueBatchRequest) (IssueBatchResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return IssueBatchResult{}, err
@@ -114,7 +123,17 @@ func (r *Registry) IssueBatch(req IssueBatchRequest) (IssueBatchResult, error) {
 				Params: sig, Rejected: true, Reason: errCode(bizErr),
 				ItemID: itemID,
 			}
-			_ = r.commit()
+			if err := r.commit(); err != nil {
+				// 拒绝结果落盘失败：这次拒绝没有被记住，不能只用业务错误
+				// 掩盖保存错误——调用者稍后用原请求重提时必须按当时状态
+				// 重新判断，而不是回放一个实际没有保存的拒绝。commit 失败
+				// 时已按磁盘内容重建状态，请求记录随之撤销；此处再删一次
+				// 以覆盖磁盘暂时不可读、状态未能重建的情形。整体返回：没有
+				// 发行结果、没有失败藏品编号、不标回放、结果中业务错误为空，
+				// error 保留实际写入错误；请求号、编号与历史序号都未被占用。
+				delete(r.state.Requests, key)
+				return IssueBatchResult{}, err
+			}
 		}
 		// 校验类错误（引用不存在等）不占用请求号，也不改变任何状态。
 		return IssueBatchResult{ItemID: itemID, Err: bizErr}, bizErr
