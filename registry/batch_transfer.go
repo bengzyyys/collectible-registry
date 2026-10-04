@@ -102,6 +102,15 @@ func transferBatchParamsSig(req TransferBatchRequest) string {
 // 改动原因、条目顺序或任一条目参数返回 ErrRequestConflict。参数错误与
 // 引用不存在不占用请求号。并发重复只能完成一次；与其他整批、单件转让或
 // 代转争用同一藏品版本时，最多一方成功。
+//
+// 状态类拒绝只有在拒绝结果落盘成功后才成立：保存这次拒绝失败（且原
+// 登记册仍可正常读取）时，不返回业务拒绝，而是与整批成功落盘失败同样
+// 返回明确的保存错误并保留实际写入错误——结果中没有转让条目、没有
+// 失败藏品编号、不标为重复回放、业务错误为空，请求号不被占用，全部
+// 藏品的持有、版本、历史与版税应付保持提交前内容。保存条件恢复后用
+// 完全相同的请求重提，按当前业务状态重新判断：状态已变得合法时正常
+// 执行，拒绝条件仍存在时重新保存拒绝，保存成功后才返回对应业务错误。
+// 参数错误与引用不存在不要求保存，存储暂时不可写时仍返回原错误。
 func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return TransferBatchResult{}, err
@@ -120,18 +129,27 @@ func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult,
 
 	itemID, bizErr := r.checkTransferBatch(req)
 	if bizErr != nil {
-		if !isValidationErr(bizErr) {
-			// 状态类业务拒绝（停用、收发同人、持有版本不符等）占用请求号
-			// 并落盘：相同参数重提永远返回这一次拒绝，即使状态后来变化。
-			r.state.Requests[key] = request{
-				Operator: req.Operator, RequestID: req.RequestID, Kind: "transfer_batch",
-				Params: sig, Rejected: true, Reason: errCode(bizErr),
-				ItemID: itemID,
-			}
-			_ = r.commit()
+		if isValidationErr(bizErr) {
+			// 参数错误与引用不存在不占用请求号，也不要求保存拒绝结果：
+			// 即使存储暂时不可写，仍直接返回原校验错误，且不改变任何
+			// 一件的持有、版本、历史或应付。
+			return TransferBatchResult{ItemID: itemID, Err: bizErr}, bizErr
 		}
-		// 藏品或账户不存在等校验错误不占用请求号，也不改变任何一件的持有、
-		// 版本、历史或应付。
+		// 状态类业务拒绝（停用、收发同人、持有版本不符等）必须先落盘才
+		// 成立：相同参数重提只有在拒绝保存成功后才回放这一次拒绝。保存
+		// 失败时不能用业务错误掩盖——commit 已以磁盘为准重新加载，内存
+		// 回到整批前状态，请求号不被这次未保存的拒绝占用；返回方式与
+		// 整批成功落盘失败一致：空结果、业务错误为空，error 明确表示
+		// 保存失败并保留实际写入错误。存储恢复后用完全相同的请求重提，
+		// 按当前业务状态重新判断（可能正常执行，也可能重新保存拒绝）。
+		r.state.Requests[key] = request{
+			Operator: req.Operator, RequestID: req.RequestID, Kind: "transfer_batch",
+			Params: sig, Rejected: true, Reason: errCode(bizErr),
+			ItemID: itemID,
+		}
+		if err := r.commit(); err != nil {
+			return TransferBatchResult{}, err
+		}
 		return TransferBatchResult{ItemID: itemID, Err: bizErr}, bizErr
 	}
 
