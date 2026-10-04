@@ -536,38 +536,18 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		Remainder: out.royalty.Remainder}, nil
 }
 
+// checkTransfer 按单件转让的优先级执行与整批共用的直接转让资格规则：
+// 参数合法后，藏品及持有记录不存在优先于账户错误，操作者的登记和停用
+// 问题优先于接收账户问题，接收账户问题优先于收发同人，收发同人又优先
+// 于持有信息不符。
 func (r *Registry) checkTransfer(req TransferRequest) error {
-	h, ok := r.state.Holdings[req.ItemID]
-	if !ok {
-		if _, itemExists := r.state.Items[req.ItemID]; !itemExists {
-			return fmt.Errorf("%w: 藏品 %s", ErrNotFound, req.ItemID)
-		}
-		return fmt.Errorf("%w: 藏品 %s 没有持有记录", ErrNotFound, req.ItemID)
-	}
-	op, ok := r.state.Accounts[req.Operator]
-	if !ok {
-		return fmt.Errorf("%w: 操作者账户 %s", ErrNotFound, req.Operator)
-	}
-	if !op.Active {
-		return fmt.Errorf("%w: 操作者账户 %s", ErrAccountInactive, req.Operator)
-	}
-	to, ok := r.state.Accounts[req.ToID]
-	if !ok {
-		return fmt.Errorf("%w: 接收账户 %s", ErrNotFound, req.ToID)
-	}
-	if !to.Active {
-		return fmt.Errorf("%w: 接收账户 %s", ErrAccountInactive, req.ToID)
-	}
-	if req.ToID == h.OwnerID {
-		return fmt.Errorf("%w: 接收人 %s 已是当前持有人", ErrSameAccount, req.ToID)
-	}
-	// 期望持有人或期望版本不符，包括发起人并非当前持有人的情况。
-	if h.OwnerID != req.ExpectedOwner || h.Version != req.ExpectedVer ||
-		req.Operator != h.OwnerID {
-		return fmt.Errorf("%w: 藏品 %s 当前为 %s 版本 %d", ErrConflict,
-			req.ItemID, h.OwnerID, h.Version)
-	}
-	return nil
+	return r.checkSingleTransferEligibility(directTransferEligibility{
+		itemID:        req.ItemID,
+		operator:      req.Operator,
+		toID:          req.ToID,
+		expectedOwner: req.ExpectedOwner,
+		expectedVer:   req.ExpectedVer,
+	})
 }
 
 func (r *Registry) replayTransfer(prev request, sig string) (TransferResult, error) {
