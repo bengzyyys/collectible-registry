@@ -102,6 +102,12 @@ func transferBatchParamsSig(req TransferBatchRequest) string {
 // 改动原因、条目顺序或任一条目参数返回 ErrRequestConflict。参数错误与
 // 引用不存在不占用请求号。并发重复只能完成一次；与其他整批、单件转让或
 // 代转争用同一藏品版本时，最多一方成功。
+//
+// 状态类拒绝的落盘失败时，返回保存错误（保留实际写入错误）而非该业务
+// 错误，结果为空（无转让条目、无失败藏品编号、不标回放、业务错误为空），
+// 请求号不被这次未保存的拒绝占用；保存条件恢复后用完全相同的请求重提，
+// 按当时的业务状态重新判断：拒绝条件仍在则重新保存此次拒绝并返回对应
+// 业务错误，状态已变为满足请求则整批正常执行。
 func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return TransferBatchResult{}, err
@@ -128,7 +134,17 @@ func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult,
 				Params: sig, Rejected: true, Reason: errCode(bizErr),
 				ItemID: itemID,
 			}
-			_ = r.commit()
+			if err := r.commit(); err != nil {
+				// 拒绝结果落盘失败：这次拒绝没有被记住，不能只用业务错误
+				// 掩盖保存错误——调用者稍后用原请求重提时必须按当时状态
+				// 重新判断，而不是回放一个实际没有保存的拒绝。commit 失败
+				// 时已按磁盘内容重建状态，请求记录随之撤销；此处再删一次
+				// 以覆盖磁盘暂时不可读、状态未能重建的情形。与整批保存
+				// 失败一样整体返回：没有转让条目、没有失败藏品编号、不标
+				// 回放、结果中业务错误为空，error 保留实际写入错误。
+				delete(r.state.Requests, key)
+				return TransferBatchResult{}, err
+			}
 		}
 		// 藏品或账户不存在等校验错误不占用请求号，也不改变任何一件的持有、
 		// 版本、历史或应付。

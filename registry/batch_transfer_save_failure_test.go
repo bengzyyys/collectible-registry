@@ -388,3 +388,219 @@ func TestTransferBatchSaveFailureRetryAfterReopen(t *testing.T) {
 	restoreBatchSave(t, r2)
 	assertBatchRetrySuccess(t, r2, req)
 }
+
+// ---- 状态类业务拒绝的保存失败 ----
+
+// assertRejectSaveFailureResult 核对"拒绝结果保存失败"的返回：error 是保存
+// 错误而非业务拒绝，结果与整批保存失败一致——没有转让条目、没有失败藏品
+// 编号、不标回放、业务错误为空。
+func assertRejectSaveFailureResult(t *testing.T, res TransferBatchResult, err error) {
+	t.Helper()
+	assertSaveFailureError(t, err)
+	if len(res.Items) != 0 || res.ItemID != "" || res.Replayed || res.Err != nil {
+		t.Fatalf("拒绝保存失败必须整体失败，结果应为空: %+v", res)
+	}
+}
+
+// assertRequestFree 核对请求号未被占用、历史序号未被消耗。
+func assertRequestFree(t *testing.T, r *Registry, req TransferBatchRequest, wantNextSeq int64) {
+	t.Helper()
+	if _, ok := r.state.Requests[requestKey(req.Operator, req.RequestID)]; ok {
+		t.Fatalf("未保存的拒绝不应占用请求号 %s", req.RequestID)
+	}
+	if r.state.NextSeq != wantNextSeq {
+		t.Fatalf("NextSeq = %d, want %d", r.state.NextSeq, wantNextSeq)
+	}
+}
+
+// rejectSaveFailureReq 构造一个会被持有状态冲突拒绝的整批请求：i1 属于
+// bob（版本 1）符合期望；i5 属于 carol（版本 1），与期望的 bob 不符，
+// 整批按清单顺序报告最前的失败藏品 i5（ErrConflict）。
+func rejectSaveFailureReq() TransferBatchRequest {
+	return tbtReq("rb-rej",
+		tbtEntry("i1", "carol", 1, 100),
+		tbtEntry("i5", "dave", 1, 200),
+	)
+}
+
+// assertWorldUntouched 核对拒绝保存失败后所有藏品的持有、版本与历史保持
+// 提交前内容（发行占用序号 1..5，无新增历史）。
+func assertWorldUntouched(t *testing.T, r *Registry) {
+	t.Helper()
+	for id, owner := range map[string]string{
+		"i1": "bob", "i2": "bob", "i3": "bob", "i4": "bob", "i5": "carol",
+	} {
+		h, err := r.GetHolding(id)
+		if err != nil {
+			t.Fatalf("GetHolding %s: %v", id, err)
+		}
+		if h.OwnerID != owner || h.Version != 1 {
+			t.Fatalf("失败后 %s 持有被改变: %+v", id, h)
+		}
+		hist, err := r.History(id)
+		if err != nil {
+			t.Fatalf("History %s: %v", id, err)
+		}
+		if len(hist) != 1 || hist[0].Kind != "issue" {
+			t.Fatalf("失败后 %s 历史多出内容: %+v", id, hist)
+		}
+	}
+}
+
+// TestTransferBatchRejectSaveFailureRetrySameState 覆盖：持有状态冲突的拒绝
+// 落盘失败时返回保存错误、请求号不被占用；保存条件恢复且拒绝条件仍在时，
+// 用完全相同的请求重提会重新保存此次拒绝，保存成功后才返回对应业务错误；
+// 此后相同请求回放该拒绝。
+func TestTransferBatchRejectSaveFailureRetrySameState(t *testing.T) {
+	r := mustCreate(t, tempDir(t))
+	setupBatchTransferWorld(t, r)
+	req := rejectSaveFailureReq()
+
+	// 拒绝条件成立（i5 不属于 bob），但保存这次拒绝失败：返回保存错误，
+	// 不是 ErrConflict；结果为空；请求号不被这次未保存的拒绝占用。
+	blockBatchSave(t, r)
+	res, err := r.TransferBatch(req)
+	assertRejectSaveFailureResult(t, res, err)
+	assertRequestFree(t, r, req, 5)
+	assertWorldUntouched(t, r)
+
+	// 保存条件恢复、拒绝条件仍在：重提重新保存此次拒绝，保存成功后返回
+	// 业务错误本身，并报告清单中最前的失败藏品。
+	restoreBatchSave(t, r)
+	res, err = r.TransferBatch(req)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("重提应在保存成功后返回业务拒绝 ErrConflict: %v", err)
+	}
+	if res.Replayed || res.ItemID != "i5" || !errors.Is(res.Err, ErrConflict) || len(res.Items) != 0 {
+		t.Fatalf("重提结果异常: %+v", res)
+	}
+	if _, ok := r.state.Requests[requestKey(req.Operator, req.RequestID)]; !ok {
+		t.Fatal("拒绝保存成功后应登记请求结果")
+	}
+	assertWorldUntouched(t, r)
+
+	// 拒绝已保存：相同内容重提回放原拒绝，即使状态后来改变也不重新执行。
+	res, err = r.TransferBatch(req)
+	if !errors.Is(err, ErrConflict) || !res.Replayed || res.ItemID != "i5" ||
+		!errors.Is(res.Err, ErrConflict) {
+		t.Fatalf("保存后的重提应回放原拒绝: %+v, err %v", res, err)
+	}
+}
+
+// TestTransferBatchRejectSaveFailureRetryAfterStateChange 覆盖：未保存的
+// 冲突拒绝不阻碍后续重提——保存条件恢复前，清单内藏品经另一笔合法转让
+// 恰好变为请求期望的持有人与版本后，用完全相同的请求重提应正常执行，
+// 不能回放那次未保存的冲突。
+func TestTransferBatchRejectSaveFailureRetryAfterStateChange(t *testing.T) {
+	r := mustCreate(t, tempDir(t))
+	setupBatchTransferWorld(t, r)
+	// i5 期望 bob 持有版本 2：当前为 carol 版本 1，先被冲突拒绝。
+	req := tbtReq("rb-rej2",
+		tbtEntry("i1", "carol", 1, 100),
+		tbtEntry("i5", "dave", 2, 200),
+	)
+
+	blockBatchSave(t, r)
+	res, err := r.TransferBatch(req)
+	assertRejectSaveFailureResult(t, res, err)
+	assertRequestFree(t, r, req, 5)
+
+	// 保存条件恢复后，carol 把 i5 合法转让给 bob：i5 变为 bob 版本 2，
+	// 恰好满足原整批请求的期望持有人与版本。
+	restoreBatchSave(t, r)
+	if _, err := r.Transfer(TransferRequest{
+		Operator: "carol", Reason: "合法转让", RequestID: "rt-i5", ItemID: "i5",
+		ExpectedOwner: "carol", ExpectedVer: 1, ToID: "bob",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 用完全相同的原请求重提：按当前业务状态判断，整批正常执行一次，
+	// 不是回放那次未保存的冲突。
+	res, err = r.TransferBatch(req)
+	if err != nil {
+		t.Fatalf("状态满足后重提应正常执行，不能回放未保存的冲突: %v", err)
+	}
+	if res.Replayed || res.ItemID != "" || res.Err != nil || len(res.Items) != 2 {
+		t.Fatalf("重提结果异常: %+v", res)
+	}
+	if res.Items[0].ItemID != "i1" || res.Items[0].FromID != "bob" ||
+		res.Items[0].ToID != "carol" || res.Items[0].Version != 2 || res.Items[0].TxSeq != 7 {
+		t.Fatalf("第一件结果异常: %+v", res.Items[0])
+	}
+	if res.Items[1].ItemID != "i5" || res.Items[1].FromID != "bob" ||
+		res.Items[1].ToID != "dave" || res.Items[1].Version != 3 || res.Items[1].TxSeq != 8 {
+		t.Fatalf("第二件结果异常: %+v", res.Items[1])
+	}
+	if h, _ := r.GetHolding("i1"); h.OwnerID != "carol" || h.Version != 2 {
+		t.Fatalf("i1 持有异常: %+v", h)
+	}
+	if h, _ := r.GetHolding("i5"); h.OwnerID != "dave" || h.Version != 3 {
+		t.Fatalf("i5 持有异常: %+v", h)
+	}
+
+	// 成功结果保存后，相同请求回放首次成功。
+	replay, err := r.TransferBatch(req)
+	if err != nil || !replay.Replayed || len(replay.Items) != 2 {
+		t.Fatalf("成功后重提应回放: %+v, err %v", replay, err)
+	}
+}
+
+// TestTransferBatchRejectSaveFailureOperatorError 覆盖：操作者账户自身
+// 有问题（停用）的拒绝落盘失败时同样返回保存错误、结果不附藏品编号；
+// 保存恢复后重提重新保存拒绝并返回账户错误（ItemID 为空）。
+func TestTransferBatchRejectSaveFailureOperatorError(t *testing.T) {
+	r := mustCreate(t, tempDir(t))
+	setupBatchTransferWorld(t, r)
+	if err := r.DeactivateAccount("bob"); err != nil {
+		t.Fatal(err)
+	}
+	req := tbtReq("rb-inactive", tbtEntry("i1", "carol", 1, 0))
+
+	blockBatchSave(t, r)
+	res, err := r.TransferBatch(req)
+	assertRejectSaveFailureResult(t, res, err)
+	assertRequestFree(t, r, req, 5)
+	assertWorldUntouched(t, r)
+
+	restoreBatchSave(t, r)
+	res, err = r.TransferBatch(req)
+	if !errors.Is(err, ErrAccountInactive) {
+		t.Fatalf("重提应在保存成功后返回 ErrAccountInactive: %v", err)
+	}
+	// 操作者账户自身有问题时不附藏品编号。
+	if res.ItemID != "" || !errors.Is(res.Err, ErrAccountInactive) || res.Replayed {
+		t.Fatalf("操作者账户错误的重提结果异常: %+v", res)
+	}
+}
+
+// TestTransferBatchValidationErrorIgnoresSaveFailure 覆盖：参数错误与引用
+// 不存在不占用请求号、不要求保存拒绝结果，即使存储暂时不可写也仍返回
+// 原参数/引用错误，不能改报保存错误。
+func TestTransferBatchValidationErrorIgnoresSaveFailure(t *testing.T) {
+	r := mustCreate(t, tempDir(t))
+	setupBatchTransferWorld(t, r)
+
+	blockBatchSave(t, r)
+	defer restoreBatchSave(t, r)
+
+	// 引用不存在的藏品：返回 ErrNotFound，不是保存错误。
+	notFoundReq := tbtReq("rb-nf", tbtEntry("nope", "carol", 1, 0))
+	res, err := r.TransferBatch(notFoundReq)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("引用不存在应返回 ErrNotFound，不能改报保存错误: %v", err)
+	}
+	if res.ItemID != "nope" || !errors.Is(res.Err, ErrNotFound) {
+		t.Fatalf("引用不存在的结果异常: %+v", res)
+	}
+	assertRequestFree(t, r, notFoundReq, 5)
+
+	// 参数错误（负价款）：返回 ErrInvalidArgument，不是保存错误。
+	badReq := tbtReq("rb-bad", TransferBatchEntry{
+		ItemID: "i1", ToID: "carol", ExpectedOwner: "bob", ExpectedVer: 1, Price: -1,
+	})
+	if _, err := r.TransferBatch(badReq); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("参数错误应返回 ErrInvalidArgument，不能改报保存错误: %v", err)
+	}
+	assertRequestFree(t, r, badReq, 5)
+}
