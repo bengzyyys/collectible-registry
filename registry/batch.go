@@ -150,41 +150,12 @@ func (r *Registry) IssueBatch(req IssueBatchRequest) (IssueBatchResult, error) {
 	return IssueBatchResult{Items: items}, nil
 }
 
-// checkIssueBatch 校验整批发行。返回业务拒绝所涉及的藏品编号（与具体
-// 某件无关时为空）与错误本身；任何一件不通过则整批拒绝。
+// checkIssueBatch 按整批发行的优先级执行与单件共用的发行资格规则。
+// 返回业务拒绝所涉及的藏品编号（操作者或系列层面的问题与具体某件无关，
+// 返回空）与错误本身；编号占用始终优先于初始持有人问题，同一类问题报告
+// 清单顺序最前的那件。任何一件不通过则整批拒绝。
 func (r *Registry) checkIssueBatch(req IssueBatchRequest) (string, error) {
-	op, ok := r.state.Accounts[req.Operator]
-	if !ok {
-		return "", fmt.Errorf("%w: 操作者账户 %s", ErrNotFound, req.Operator)
-	}
-	if !op.Active {
-		return "", fmt.Errorf("%w: 操作者账户 %s", ErrAccountInactive, req.Operator)
-	}
-	s, ok := r.state.Series[req.SeriesID]
-	if !ok {
-		return "", fmt.Errorf("%w: 系列 %s", ErrNotFound, req.SeriesID)
-	}
-	if s.Sealed {
-		return "", fmt.Errorf("%w: 系列 %s", ErrSeriesSealed, req.SeriesID)
-	}
-	if s.CreatorID != req.Operator {
-		return "", fmt.Errorf("%w: 只有系列创建账户 %s 可以发行", ErrForbidden, s.CreatorID)
-	}
-	for _, e := range req.Entries {
-		if _, ok := r.state.Items[e.ItemID]; ok {
-			return e.ItemID, fmt.Errorf("%w: 藏品编号 %s 已被使用", ErrAlreadyExists, e.ItemID)
-		}
-	}
-	for _, e := range req.Entries {
-		h, ok := r.state.Accounts[e.HolderID]
-		if !ok {
-			return e.ItemID, fmt.Errorf("%w: 初始持有人账户 %s", ErrNotFound, e.HolderID)
-		}
-		if !h.Active {
-			return e.ItemID, fmt.Errorf("%w: 初始持有人账户 %s", ErrAccountInactive, e.HolderID)
-		}
-	}
-	return "", nil
+	return r.checkBatchIssueEligibility(req.Operator, req.SeriesID, req.Entries)
 }
 
 func (r *Registry) replayIssueBatch(prev request, sig string) (IssueBatchResult, error) {

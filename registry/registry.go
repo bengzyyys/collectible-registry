@@ -347,35 +347,11 @@ func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 	return IssueResult{ItemID: req.ItemID, OwnerID: req.HolderID, Version: 1, TxSeq: seq}, nil
 }
 
+// checkIssue 按单件发行的优先级执行与整批共用的发行资格规则：参数合法
+// 后，操作者的登记/停用问题优先于系列问题，系列问题内部依次为不存在、
+// 已封存、操作者不是创建账户，藏品编号已占用又优先于初始持有人问题。
 func (r *Registry) checkIssue(req IssueRequest) error {
-	op, ok := r.state.Accounts[req.Operator]
-	if !ok {
-		return fmt.Errorf("%w: 操作者账户 %s", ErrNotFound, req.Operator)
-	}
-	if !op.Active {
-		return fmt.Errorf("%w: 操作者账户 %s", ErrAccountInactive, req.Operator)
-	}
-	s, ok := r.state.Series[req.SeriesID]
-	if !ok {
-		return fmt.Errorf("%w: 系列 %s", ErrNotFound, req.SeriesID)
-	}
-	if s.Sealed {
-		return fmt.Errorf("%w: 系列 %s", ErrSeriesSealed, req.SeriesID)
-	}
-	if s.CreatorID != req.Operator {
-		return fmt.Errorf("%w: 只有系列创建账户 %s 可以发行", ErrForbidden, s.CreatorID)
-	}
-	if _, ok := r.state.Items[req.ItemID]; ok {
-		return fmt.Errorf("%w: 藏品编号 %s 已被使用", ErrAlreadyExists, req.ItemID)
-	}
-	h, ok := r.state.Accounts[req.HolderID]
-	if !ok {
-		return fmt.Errorf("%w: 初始持有人账户 %s", ErrNotFound, req.HolderID)
-	}
-	if !h.Active {
-		return fmt.Errorf("%w: 初始持有人账户 %s", ErrAccountInactive, req.HolderID)
-	}
-	return nil
+	return r.checkSingleIssueEligibility(req.Operator, req.SeriesID, req.ItemID, req.HolderID)
 }
 
 func (r *Registry) replayIssue(prev request, sig string) (IssueResult, error) {
