@@ -165,42 +165,30 @@ func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult,
 	return TransferBatchResult{Items: items}, nil
 }
 
-// checkTransferBatch 校验整批转让。操作者层面的错误（未登记或停用）最先
-// 返回且不关联具体藏品（ItemID 为空）；其余按清单顺序逐件沿用单件转让
-// 规则，返回第一件失败的藏品编号与错误。任何一件不通过则整批拒绝。
+// checkTransferBatch 校验整批转让。它与单件转让共用同一套资格规则
+// （藏品与持有记录存在、账户登记且可用、收发不同人、操作者与期望持有
+// 信息匹配），只是组织顺序保留整批入口原有的报告方式：操作者层面的错误
+// （未登记或停用）最先返回且不关联具体藏品（ItemID 为空）；操作者可用
+// 后才按清单顺序逐件检查，返回第一件失败的藏品编号与错误，后面条目的
+// 错误不提前报告。任何一件不通过则整批拒绝。
 func (r *Registry) checkTransferBatch(req TransferBatchRequest) (string, error) {
-	op, ok := r.state.Accounts[req.Operator]
-	if !ok {
-		return "", fmt.Errorf("%w: 操作者账户 %s", ErrNotFound, req.Operator)
+	if err := r.checkTransferParty(req.Operator, "操作者账户"); err != nil {
+		return "", err
 	}
-	if !op.Active {
-		return "", fmt.Errorf("%w: 操作者账户 %s", ErrAccountInactive, req.Operator)
-	}
-	for _, e := range req.Entries {
-		h, ok := r.state.Holdings[e.ItemID]
-		if !ok {
-			if _, itemExists := r.state.Items[e.ItemID]; !itemExists {
-				return e.ItemID, fmt.Errorf("%w: 藏品 %s", ErrNotFound, e.ItemID)
-			}
-			return e.ItemID, fmt.Errorf("%w: 藏品 %s 没有持有记录", ErrNotFound, e.ItemID)
+	for _, en := range req.Entries {
+		e := transferEligibility{
+			ItemID: en.ItemID, OperatorID: req.Operator, RecipientID: en.ToID,
+			ExpectedOwner: en.ExpectedOwner, ExpectedVer: en.ExpectedVer,
 		}
-		to, ok := r.state.Accounts[e.ToID]
-		if !ok {
-			return e.ItemID, fmt.Errorf("%w: 接收账户 %s", ErrNotFound, e.ToID)
+		h, err := r.checkTransferHolding(e.ItemID)
+		if err != nil {
+			return e.ItemID, err
 		}
-		if !to.Active {
-			return e.ItemID, fmt.Errorf("%w: 接收账户 %s", ErrAccountInactive, e.ToID)
+		if err := r.checkTransferParty(e.RecipientID, "接收账户"); err != nil {
+			return e.ItemID, err
 		}
-		if e.ToID == h.OwnerID {
-			return e.ItemID, fmt.Errorf("%w: 接收人 %s 已是藏品 %s 的当前持有人",
-				ErrSameAccount, e.ToID, e.ItemID)
-		}
-		// 期望持有人或期望版本不符，包括操作者并非该件当前持有人的情况；
-		// 系列封存不阻止转让，这里不检查封存状态。
-		if h.OwnerID != e.ExpectedOwner || h.Version != e.ExpectedVer ||
-			req.Operator != h.OwnerID {
-			return e.ItemID, fmt.Errorf("%w: 藏品 %s 当前为 %s 版本 %d",
-				ErrConflict, e.ItemID, h.OwnerID, h.Version)
+		if err := checkTransferMatch(e, h, true); err != nil {
+			return e.ItemID, err
 		}
 	}
 	return "", nil

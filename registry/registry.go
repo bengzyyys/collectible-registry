@@ -536,38 +536,87 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		Remainder: out.royalty.Remainder}, nil
 }
 
-func (r *Registry) checkTransfer(req TransferRequest) error {
-	h, ok := r.state.Holdings[req.ItemID]
+// transferEligibility 汇总一笔直接转让资格判断所需的身份与期望持有信息，
+// 单件转让（Transfer）与整批转让（TransferBatch）中的每件都适配到同一
+// 结构，共用同一套资格规则。价款等参数合法性已在各自的 validatePresent
+// 中处理，不属于资格规则。
+type transferEligibility struct {
+	ItemID        string // 藏品编号
+	OperatorID    string // 操作者，必须是当前持有人且账户可用
+	RecipientID   string // 接收账户，必须已登记且可用且不同于当前持有人
+	ExpectedOwner string // 期望当前持有人
+	ExpectedVer   int64  // 期望当前持有版本
+}
+
+// checkTransferHolding 是直接转让资格规则中的藏品判断：藏品与其持有记录
+// 必须都存在。藏品本身不存在、或藏品存在却没有持有记录都返回包裹
+// ErrNotFound 的引用错误（不占用请求号）；通过时返回当前持有。系列封存
+// 不在此列——封存不影响已发行藏品的转让。
+func (r *Registry) checkTransferHolding(itemID string) (holding, error) {
+	h, ok := r.state.Holdings[itemID]
 	if !ok {
-		if _, itemExists := r.state.Items[req.ItemID]; !itemExists {
-			return fmt.Errorf("%w: 藏品 %s", ErrNotFound, req.ItemID)
+		if _, itemExists := r.state.Items[itemID]; !itemExists {
+			return holding{}, fmt.Errorf("%w: 藏品 %s", ErrNotFound, itemID)
 		}
-		return fmt.Errorf("%w: 藏品 %s 没有持有记录", ErrNotFound, req.ItemID)
+		return holding{}, fmt.Errorf("%w: 藏品 %s 没有持有记录", ErrNotFound, itemID)
 	}
-	op, ok := r.state.Accounts[req.Operator]
+	return h, nil
+}
+
+// checkTransferParty 是直接转让资格规则中的账户判断：账户必须已登记且
+// 可用。未登记返回 ErrNotFound，已停用返回 ErrAccountInactive；role 是
+// 错误信息中的角色描述（操作者账户、接收账户）。
+func (r *Registry) checkTransferParty(id, role string) error {
+	a, ok := r.state.Accounts[id]
 	if !ok {
-		return fmt.Errorf("%w: 操作者账户 %s", ErrNotFound, req.Operator)
+		return fmt.Errorf("%w: %s %s", ErrNotFound, role, id)
 	}
-	if !op.Active {
-		return fmt.Errorf("%w: 操作者账户 %s", ErrAccountInactive, req.Operator)
-	}
-	to, ok := r.state.Accounts[req.ToID]
-	if !ok {
-		return fmt.Errorf("%w: 接收账户 %s", ErrNotFound, req.ToID)
-	}
-	if !to.Active {
-		return fmt.Errorf("%w: 接收账户 %s", ErrAccountInactive, req.ToID)
-	}
-	if req.ToID == h.OwnerID {
-		return fmt.Errorf("%w: 接收人 %s 已是当前持有人", ErrSameAccount, req.ToID)
-	}
-	// 期望持有人或期望版本不符，包括发起人并非当前持有人的情况。
-	if h.OwnerID != req.ExpectedOwner || h.Version != req.ExpectedVer ||
-		req.Operator != h.OwnerID {
-		return fmt.Errorf("%w: 藏品 %s 当前为 %s 版本 %d", ErrConflict,
-			req.ItemID, h.OwnerID, h.Version)
+	if !a.Active {
+		return fmt.Errorf("%w: %s %s", ErrAccountInactive, role, id)
 	}
 	return nil
+}
+
+// checkTransferMatch 是直接转让资格规则中与当前持有比对的一步，优先级
+// 固定：收发同人（接收人不得是当前持有人）优先于持有信息不符；持有信息
+// 不符涵盖操作者并非当前持有人、期望持有人或期望版本与当前不一致。
+// batchMessage 为 true 时收发同人信息带上藏品编号（整批入口的原措辞），
+// 单件入口沿用不含藏品编号的措辞；判定规则与错误哨兵两入口完全一致。
+func checkTransferMatch(e transferEligibility, h holding, batchMessage bool) error {
+	if e.RecipientID == h.OwnerID {
+		if batchMessage {
+			return fmt.Errorf("%w: 接收人 %s 已是藏品 %s 的当前持有人",
+				ErrSameAccount, e.RecipientID, e.ItemID)
+		}
+		return fmt.Errorf("%w: 接收人 %s 已是当前持有人", ErrSameAccount, e.RecipientID)
+	}
+	if h.OwnerID != e.ExpectedOwner || h.Version != e.ExpectedVer ||
+		e.OperatorID != h.OwnerID {
+		return fmt.Errorf("%w: 藏品 %s 当前为 %s 版本 %d",
+			ErrConflict, e.ItemID, h.OwnerID, h.Version)
+	}
+	return nil
+}
+
+// checkTransfer 按单件转让的优先级套用两入口共用的资格规则：藏品及持有
+// 记录不存在优先于账户错误；操作者的登记与停用问题优先于接收账户；接收
+// 账户问题优先于收发同人；收发同人又优先于持有信息不符。
+func (r *Registry) checkTransfer(req TransferRequest) error {
+	e := transferEligibility{
+		ItemID: req.ItemID, OperatorID: req.Operator, RecipientID: req.ToID,
+		ExpectedOwner: req.ExpectedOwner, ExpectedVer: req.ExpectedVer,
+	}
+	h, err := r.checkTransferHolding(e.ItemID)
+	if err != nil {
+		return err
+	}
+	if err := r.checkTransferParty(e.OperatorID, "操作者账户"); err != nil {
+		return err
+	}
+	if err := r.checkTransferParty(e.RecipientID, "接收账户"); err != nil {
+		return err
+	}
+	return checkTransferMatch(e, h, false)
 }
 
 func (r *Registry) replayTransfer(prev request, sig string) (TransferResult, error) {
