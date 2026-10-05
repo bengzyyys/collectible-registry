@@ -344,6 +344,18 @@ func answerIntentParamsSig(req AnswerSplitIntentRequest) string {
 //
 // 请求号语义与其他操作一致：相同参数重提回放首次结果，参数不同返回
 // ErrRequestConflict；参数错误与引用不存在不占用请求号。
+//
+// 一次答复是否生效始终以保存完成为准：本次答复（同意或拒绝）、意向终结
+// 状态、意向历史与请求结果尚未写入原登记册而保存失败时，返回实际保存
+// 错误，不返回成功，也不用随后读取数据的错误或原业务拒绝替代它；结果
+// 为空（无意向编号、无状态、业务错误为空、不标回放），请求号与意向历史
+// 序号都不被这次未保存的答复消耗。即使失败后原数据暂时无法读取、状态未
+// 能按磁盘重建，同一个仍打开的登记册中各方此前已保存的答复、份额与意向
+// 结束时间仍保持原样，意向状态继续按原有答复、当前持有与账户状态及当前
+// 时间判断，意向历史不出现这次答复；后续其他操作成功保存也不会把这次
+// 未保存的答复或终结状态带入登记册。保存条件恢复后用原请求号和相同内容
+// 重提，按当时的意向状态重新处理（首次重新成功不标回放；意向此时已过期
+// 或失效则沿用现有对应拒绝），真正保存成功后相同请求才回放首次结果。
 func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitIntentResult, error) {
 	missing := []string{}
 	if strings.TrimSpace(req.Operator) == "" {
@@ -391,7 +403,10 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 	if idx < 0 {
 		bizErr := fmt.Errorf("%w: 账户 %s 不在意向 %s 的分配方案中",
 			ErrForbidden, req.Operator, req.IntentID)
-		r.recordIntentRequest(key, sig, req.Operator, req.RequestID, "intent_answer", req.IntentID, bizErr)
+		if err := r.saveIntentRequestRejection(key, sig, req.Operator, req.RequestID,
+			"intent_answer", req.IntentID, bizErr); err != nil {
+			return AnswerSplitIntentResult{}, err
+		}
 		return AnswerSplitIntentResult{IntentID: req.IntentID, Err: bizErr}, bizErr
 	}
 	answer := SplitAnswerReject
@@ -402,7 +417,10 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 	switch status := r.intentCurrentStatus(rec, now); status {
 	case SplitRejected, SplitWithdrawn, SplitInvalid, SplitExpired:
 		bizErr := intentEndedErr(status, req.IntentID)
-		r.recordIntentRequest(key, sig, req.Operator, req.RequestID, "intent_answer", req.IntentID, bizErr)
+		if err := r.saveIntentRequestRejection(key, sig, req.Operator, req.RequestID,
+			"intent_answer", req.IntentID, bizErr); err != nil {
+			return AnswerSplitIntentResult{}, err
+		}
 		return AnswerSplitIntentResult{IntentID: req.IntentID, Err: bizErr}, bizErr
 	}
 	if prev := rec.Shares[idx].Answer; prev != "" {
@@ -415,6 +433,10 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 				Params: sig, IntentID: req.IntentID, Status: status,
 			}
 			if err := r.commit(); err != nil {
+				// 这次重复答复只登记请求结果、不改动意向与历史；保存失败且
+				// 状态未能按磁盘重建时，显式撤销未保存的请求号占用，整体
+				// 返回空结果与实际保存错误。
+				delete(r.state.Requests, key)
 				return AnswerSplitIntentResult{}, err
 			}
 			return AnswerSplitIntentResult{IntentID: req.IntentID, Status: status}, nil
@@ -422,11 +444,24 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 		// 已答复后改答拒绝。
 		bizErr := fmt.Errorf("%w: 账户 %s 已答复 %s，不能改为 %s",
 			ErrSplitAnswered, req.Operator, prev, answer)
-		r.recordIntentRequest(key, sig, req.Operator, req.RequestID, "intent_answer", req.IntentID, bizErr)
+		if err := r.saveIntentRequestRejection(key, sig, req.Operator, req.RequestID,
+			"intent_answer", req.IntentID, bizErr); err != nil {
+			return AnswerSplitIntentResult{}, err
+		}
 		return AnswerSplitIntentResult{IntentID: req.IntentID, Err: bizErr}, bizErr
 	}
 
 	from := r.intentCurrentStatus(rec, now)
+	// 回滚基点：保存失败且磁盘暂时不可读、状态未能按磁盘重建时，本次
+	// 未保存的答复、意向终结状态、答复记录与请求号占用都必须显式撤销，
+	// 否则随后查询会把这次答复当作已生效，后续任何一次成功保存还会把这份
+	// 未保存的答复与终结状态带进登记册。
+	prevIntentSeq := r.state.NextIntentSeq
+	prevEvents := len(r.state.IntentEvents)
+	prevRec := rec
+	// rec.Shares 与 prevRec 共享底层数组，先复制再改，回滚副本才能保留
+	// 提交前各方已保存的答复。
+	rec.Shares = append([]intentShare(nil), rec.Shares...)
 	rec.Shares[idx].Answer = answer
 	if answer == SplitAnswerReject {
 		// 任一参与账户拒绝即终结为已拒绝（落盘终态）。
@@ -435,7 +470,7 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 	}
 	r.state.Intents[req.IntentID] = rec
 	to := r.intentCurrentStatus(rec, now)
-	seq := r.state.NextIntentSeq + 1
+	seq := prevIntentSeq + 1
 	r.state.NextIntentSeq = seq
 	r.state.IntentEvents = append(r.state.IntentEvents, intentEvent{
 		Seq: seq, IntentID: req.IntentID, ItemID: rec.ItemID, Kind: "answer",
@@ -447,6 +482,16 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 		Params: sig, IntentID: req.IntentID, Status: to,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已随旧
+		// 状态整体撤销（请求记录不存在），无需再动；磁盘暂时不可读、状态
+		// 未能重建时请求记录仍在，据此把本次未保存的改动全部撤销——意向
+		// 恢复为提交前的答复、份额与结束时间，历史与序号回退，请求号释放。
+		if _, ok := r.state.Requests[key]; ok {
+			delete(r.state.Requests, key)
+			r.state.Intents[req.IntentID] = prevRec
+			r.state.IntentEvents = r.state.IntentEvents[:prevEvents]
+			r.state.NextIntentSeq = prevIntentSeq
+		}
 		return AnswerSplitIntentResult{}, err
 	}
 	return AnswerSplitIntentResult{IntentID: req.IntentID, Status: to}, nil
@@ -473,6 +518,24 @@ func (r *Registry) recordIntentRequest(key, sig, operator, requestID, kind, inte
 		Params: sig, Rejected: true, Reason: errCode(bizErr), IntentID: intentID,
 	}
 	_ = r.commit()
+}
+
+// saveIntentRequestRejection 登记意向类操作的状态类业务拒绝并落盘。与
+// recordIntentRequest 不同：保存失败时撤销这次未保存的请求号占用并把实际
+// 保存错误返回给调用者，绝不吞掉写入错误、也不让未保存的拒绝留在当前
+// 登记册中。
+func (r *Registry) saveIntentRequestRejection(key, sig, operator, requestID, kind, intentID string, bizErr error) error {
+	r.state.Requests[key] = request{
+		Operator: operator, RequestID: requestID, Kind: kind,
+		Params: sig, Rejected: true, Reason: errCode(bizErr), IntentID: intentID,
+	}
+	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态；磁盘暂时不可读、状态未能
+		// 重建时请求记录仍在，显式撤销，使这次未保存的拒绝不占用请求号。
+		delete(r.state.Requests, key)
+		return err
+	}
+	return nil
 }
 
 func (r *Registry) replayAnswerIntent(prev request, sig string) (AnswerSplitIntentResult, error) {
