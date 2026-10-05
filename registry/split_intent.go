@@ -344,6 +344,18 @@ func answerIntentParamsSig(req AnswerSplitIntentRequest) string {
 //
 // 请求号语义与其他操作一致：相同参数重提回放首次结果，参数不同返回
 // ErrRequestConflict；参数错误与引用不存在不占用请求号。
+//
+// 答复是否生效以保存完成为准：新答复尚未写入原登记册而保存失败（如数据
+// 位置暂时无法写入）时，返回实际保存错误，不报告答复成功；结果为空
+// （意向编号与状态为空、不标回放、业务错误为空），error 说明保存失败。
+// 即使失败后原数据暂时无法读取、状态未能按磁盘重建，这次答复也不留下
+// 任何痕迹：同一登记册中各参与账户此前已保存的答复、份额与意向结束时间
+// 保持原样，意向状态继续按原有答复、当前持有与账户状态以及当前时间判断，
+// 不提前变为已达成或已拒绝；意向历史不出现这次未保存的答复，请求号与
+// 意向历史序号都不被消耗，后续其他操作成功保存也不会把这次未保存的答复、
+// 终结状态或历史带进登记册。保存条件恢复后用完全相同的请求重提，按当时
+// 的意向状态重新处理：仍有效则正常记录答复（首次重提不标回放），已过期
+// 或已失效则沿用对应的拒绝。
 func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitIntentResult, error) {
 	missing := []string{}
 	if strings.TrimSpace(req.Operator) == "" {
@@ -415,6 +427,11 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 				Params: sig, IntentID: req.IntentID, Status: status,
 			}
 			if err := r.commit(); err != nil {
+				// 与首次答复一致：请求结果以保存完成为准。commit 失败时已
+				// 尝试按磁盘内容重建状态；磁盘暂时不可读、状态未能重建时
+				// 请求记录仍在，据此撤销这次未保存的请求号占用，避免后续
+				// 成功保存把它带进登记册、让重提误标为回放。
+				delete(r.state.Requests, key)
 				return AnswerSplitIntentResult{}, err
 			}
 			return AnswerSplitIntentResult{IntentID: req.IntentID, Status: status}, nil
@@ -427,6 +444,16 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 	}
 
 	from := r.intentCurrentStatus(rec, now)
+	// 回滚基点：保存失败且磁盘暂时不可读、状态未能按磁盘重建时，本次未
+	// 保存的答复、终结状态、答复记录与请求号占用都必须显式撤销，否则后续
+	// 查询会把这次答复当成已生效（甚至把意向显示为已达成或已拒绝），后续
+	// 任何一次成功保存也会把它带进登记册。
+	prevRec := rec
+	// Shares 是切片，结构体赋值仍共享底层数组；答复写在前必须单独复制，
+	// 否则回滚恢复的仍是已修改的答复。
+	prevRec.Shares = append([]intentShare(nil), rec.Shares...)
+	prevIntentSeq := r.state.NextIntentSeq
+	prevEvents := len(r.state.IntentEvents)
 	rec.Shares[idx].Answer = answer
 	if answer == SplitAnswerReject {
 		// 任一参与账户拒绝即终结为已拒绝（落盘终态）。
@@ -447,6 +474,16 @@ func (r *Registry) AnswerSplitIntent(req AnswerSplitIntentRequest) (AnswerSplitI
 		Params: sig, IntentID: req.IntentID, Status: to,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已
+		// 随旧状态整体撤销（请求记录不存在），无需再动；磁盘暂时不可读、
+		// 状态未能重建时请求记录仍在，据此把本次未保存的改动全部撤销——
+		// 答复与终结状态、答复历史、历史序号与请求号占用都恢复原样。
+		if _, ok := r.state.Requests[key]; ok {
+			delete(r.state.Requests, key)
+			r.state.Intents[req.IntentID] = prevRec
+			r.state.IntentEvents = r.state.IntentEvents[:prevEvents]
+			r.state.NextIntentSeq = prevIntentSeq
+		}
 		return AnswerSplitIntentResult{}, err
 	}
 	return AnswerSplitIntentResult{IntentID: req.IntentID, Status: to}, nil
