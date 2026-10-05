@@ -78,6 +78,16 @@ func setRoyaltyParamsSig(req SetRoyaltyRequest, shares []royaltyShare) string {
 // 请求号与发行、转让等操作共用同一操作者的请求号范围：相同业务参数
 // 重提返回首次结果，参数不同返回 ErrRequestConflict；参数错误与引用
 // 不存在不占用请求号。
+//
+// 成功与状态类拒绝都以保存完成为准：本次规则、变更记录与请求结果尚未
+// 写入原登记册而保存失败（如数据位置暂时无法写入）时，返回实际保存错误，
+// 不报告设置成功，也不只返回原业务拒绝；结果为空（系列编号、份额与业务
+// 错误均为空、不标回放），error 说明保存失败。即使失败后原数据暂时无法
+// 读取、状态未能按磁盘重建，这次操作也不留下任何规则变化、变更记录或
+// 请求号占用，变更序号不被消耗，后续其他操作成功保存也不会把这次未保存
+// 的内容带进登记册。保存条件恢复后用完全相同的请求重提，按当时的业务
+// 状态重新判断：拒绝条件仍在则重新保存此次拒绝并返回对应业务错误（首次
+// 重提不标回放），状态已满足请求则正常设置。
 func (r *Registry) SetRoyalty(req SetRoyaltyRequest) (SetRoyaltyResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return SetRoyaltyResult{}, err
@@ -109,16 +119,31 @@ func (r *Registry) SetRoyalty(req SetRoyaltyRequest) (SetRoyaltyResult, error) {
 				Params: sig, Rejected: true, Reason: errCode(bizErr),
 				SeriesID: req.SeriesID,
 			}
-			_ = r.commit()
+			if err := r.commit(); err != nil {
+				// 拒绝结果落盘失败：这次拒绝没有被记住，与发行、转让一致——
+				// 不能只用业务错误掩盖保存错误，调用者稍后用原请求重提时
+				// 必须按当时状态重新判断，而不是回放一个实际没有保存的
+				// 拒绝。commit 失败时已按磁盘内容重建状态，请求记录随之
+				// 撤销；此处再删一次以覆盖磁盘暂时不可读、状态未能重建
+				// 的情形。整体返回空结果：无系列编号、无份额、不标回放、
+				// 结果中业务错误为空，error 保留实际写入错误。
+				delete(r.state.Requests, key)
+				return SetRoyaltyResult{}, err
+			}
 		}
 		return SetRoyaltyResult{SeriesID: req.SeriesID, Err: bizErr}, bizErr
 	}
 
 	s := r.state.Series[req.SeriesID]
 	before := append([]royaltyShare(nil), s.Royalty...)
+	// 回滚基点：保存失败且磁盘暂时不可读、状态未能按磁盘重建时，本次
+	// 未保存的规则变化、变更记录与请求号占用都必须显式撤销，否则后续
+	// 任何一次成功保存都会把这份未保存的规则带进登记册。
+	prevRoyaltySeq := r.state.NextRoyaltySeq
+	prevEvents := len(r.state.RoyaltyEvents)
 	s.Royalty = shares
 	r.state.Series[req.SeriesID] = s
-	seq := r.state.NextRoyaltySeq + 1
+	seq := prevRoyaltySeq + 1
 	r.state.NextRoyaltySeq = seq
 	r.state.RoyaltyEvents = append(r.state.RoyaltyEvents, royaltyEvent{
 		Seq: seq, SeriesID: req.SeriesID, Operator: req.Operator,
@@ -131,6 +156,19 @@ func (r *Registry) SetRoyalty(req SetRoyaltyRequest) (SetRoyaltyResult, error) {
 		Params: sig, SeriesID: req.SeriesID, Shares: shares,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已
+		// 随旧状态整体撤销（请求记录不存在），无需再动；磁盘暂时不可读、
+		// 状态未能重建时请求记录仍在，据此把本次未保存的改动全部撤销——
+		// 原规则（含原本就没有规则的空规则）完整恢复，变更记录与序号、
+		// 请求号占用一并撤销。
+		if _, ok := r.state.Requests[key]; ok {
+			delete(r.state.Requests, key)
+			cur := r.state.Series[req.SeriesID]
+			cur.Royalty = before
+			r.state.Series[req.SeriesID] = cur
+			r.state.RoyaltyEvents = r.state.RoyaltyEvents[:prevEvents]
+			r.state.NextRoyaltySeq = prevRoyaltySeq
+		}
 		return SetRoyaltyResult{}, err
 	}
 	return SetRoyaltyResult{SeriesID: req.SeriesID, Shares: publicShares(shares)}, nil
