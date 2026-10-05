@@ -665,6 +665,14 @@ func createAuthzParamsSig(req CreateAuthorizationRequest) string {
 // 请求号与发行、转让共用同一操作者的请求号范围：相同业务参数重提返回
 // 首次结果（成功或状态类业务拒绝），参数变化返回 ErrRequestConflict；
 // 参数错误与引用不存在不占用请求号。
+//
+// 成功与状态类拒绝都以保存完成为准：结果尚未写入原登记册而落盘失败时，
+// 返回实际保存错误（保留实际写入错误），不能报告创建成功，也不能只返回
+// 原业务拒绝；结果为空（无授权编号、无状态、绑定版本为零、不标回放、
+// 业务错误为空），请求号不被这次未保存的结果占用，即使失败后原数据暂时
+// 无法读取，也不留下新增授权、创建记录或请求号占用。保存条件恢复后用
+// 完全相同的请求重提，按当时的业务状态重新判断：拒绝条件仍在则重新保存
+// 此次拒绝并返回对应业务错误，状态已变为满足请求则正常创建。
 func (r *Registry) CreateAuthorization(req CreateAuthorizationRequest) (CreateAuthorizationResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return CreateAuthorizationResult{}, err
@@ -684,14 +692,25 @@ func (r *Registry) CreateAuthorization(req CreateAuthorizationRequest) (CreateAu
 
 	if bizErr := r.checkCreateAuthorization(req, now); bizErr != nil {
 		if !isValidationErr(bizErr) {
-			// 状态类业务拒绝（编号占用、停用、同人、版本不符、到期时间
-			// 已过等）占用请求号并落盘；参数错误与引用不存在不占用。
+			// 状态类业务拒绝（编号占用、停用、同人、版本不符等）占用请求号
+			// 并落盘；参数错误与引用不存在不占用。
 			r.state.Requests[key] = request{
 				Operator: req.Operator, RequestID: req.RequestID, Kind: "auth_create",
 				Params: sig, Rejected: true, Reason: errCode(bizErr),
 				AuthID: req.AuthID, ItemID: req.ItemID,
 			}
-			_ = r.commit()
+			if err := r.commit(); err != nil {
+				// 拒绝结果落盘失败：这次拒绝没有被记住，与发行、转让一致——
+				// 不能只用业务错误掩盖保存错误，调用者稍后用原请求重提时
+				// 必须按当时状态重新判断，而不是回放一个实际没有保存的
+				// 拒绝。commit 失败时已按磁盘内容重建状态，请求记录随之
+				// 撤销；此处再删一次以覆盖磁盘暂时不可读、状态未能重建
+				// 的情形。整体返回空结果：无授权编号、无状态、绑定版本
+				// 为零、不标回放、结果中业务错误为空，error 保留实际
+				// 写入错误。
+				delete(r.state.Requests, key)
+				return CreateAuthorizationResult{}, err
+			}
 		}
 		return CreateAuthorizationResult{AuthID: req.AuthID, Err: bizErr}, bizErr
 	}
@@ -702,6 +721,11 @@ func (r *Registry) CreateAuthorization(req CreateAuthorizationRequest) (CreateAu
 		TrusteeID: req.TrusteeID, ToID: req.ToID, ExpiresAt: req.ExpiresAt,
 		GrantVer: h.Version, Price: req.Price, CreatedAt: now,
 	}
+	// 记录变更前位置，落盘失败且磁盘暂时不可读（状态未能按磁盘重建）时
+	// 据此把这次未保存的创建从内存状态中彻底撤掉：不留下新增授权、创建
+	// 记录或请求号占用，授权变更序号也不被消耗。
+	prevAuthSeq := r.state.NextAuthSeq
+	prevEvents := len(r.state.AuthEvents)
 	r.state.Authzs[req.AuthID] = a
 	authSeq := r.state.NextAuthSeq + 1
 	r.state.NextAuthSeq = authSeq
@@ -715,6 +739,15 @@ func (r *Registry) CreateAuthorization(req CreateAuthorizationRequest) (CreateAu
 		Params: sig, AuthID: req.AuthID, ItemID: req.ItemID, Version: h.Version,
 	}
 	if err := r.commit(); err != nil {
+		// 创建结果落盘失败：不能报告创建成功。commit 失败时已尝试按磁盘
+		// 内容重建状态；无论重建是否成功，这里都把本次变更撤销到操作前，
+		// 保证同一登记册上查询不到这份未保存的授权，后续其他操作成功
+		// 落盘也不会把它一起写入。整体返回空结果，error 保留实际写入
+		// 错误。
+		delete(r.state.Authzs, req.AuthID)
+		r.state.NextAuthSeq = prevAuthSeq
+		r.state.AuthEvents = r.state.AuthEvents[:prevEvents]
+		delete(r.state.Requests, key)
 		return CreateAuthorizationResult{}, err
 	}
 	return CreateAuthorizationResult{AuthID: req.AuthID, Status: AuthActive, GrantVer: h.Version}, nil
