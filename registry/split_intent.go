@@ -511,19 +511,9 @@ func intentEndedErr(status, intentID string) error {
 	}
 }
 
-// recordIntentRequest 记录意向类操作的状态类业务拒绝并尽力落盘。
-func (r *Registry) recordIntentRequest(key, sig, operator, requestID, kind, intentID string, bizErr error) {
-	r.state.Requests[key] = request{
-		Operator: operator, RequestID: requestID, Kind: kind,
-		Params: sig, Rejected: true, Reason: errCode(bizErr), IntentID: intentID,
-	}
-	_ = r.commit()
-}
-
-// saveIntentRequestRejection 登记意向类操作的状态类业务拒绝并落盘。与
-// recordIntentRequest 不同：保存失败时撤销这次未保存的请求号占用并把实际
-// 保存错误返回给调用者，绝不吞掉写入错误、也不让未保存的拒绝留在当前
-// 登记册中。
+// saveIntentRequestRejection 登记意向类操作的状态类业务拒绝并落盘。保存
+// 失败时撤销这次未保存的请求号占用并把实际保存错误返回给调用者，绝不吞掉
+// 写入错误、也不让未保存的拒绝留在当前登记册中。
 func (r *Registry) saveIntentRequestRejection(key, sig, operator, requestID, kind, intentID string, bizErr error) error {
 	r.state.Requests[key] = request{
 		Operator: operator, RequestID: requestID, Kind: kind,
@@ -564,7 +554,25 @@ func withdrawIntentParamsSig(req WithdrawSplitIntentRequest) string {
 // WithdrawSplitIntent 由发起人撤回仍有效的待确认或已达成意向。仅发起人
 // 可撤回（ErrForbidden）；已拒绝的意向不能撤回（ErrSplitIntentRejected），
 // 已失效或已过期的意向拒绝撤回并说明原因；已撤回后再次撤回成功但不新增
-// 记录（幂等）。请求号语义与其他操作一致。
+// 记录（幂等）。
+//
+// 请求号语义与其他操作一致：相同参数重提回放首次结果，参数不同返回
+// ErrRequestConflict；必填内容缺失与引用不存在不占用请求号。
+//
+// 一次撤回（含幂等的重复撤回）以及无权撤回、已拒绝、已失效、已过期等
+// 状态类拒绝是否生效始终以保存完成为准：撤回后的意向状态、结束时间、
+// 撤回历史与请求结果尚未写入原登记册而保存失败时，返回实际保存错误，
+// 不返回成功，也不用业务拒绝或随后读取数据的错误替代它；结果为空
+// （无意向编号、无状态、业务错误为空、不标回放），请求号与意向历史序号
+// 都不被这次未保存的撤回消耗。即使失败后原数据暂时无法读取、状态未能按
+// 磁盘重建，同一个仍打开的登记册中原方案、各方此前的答复、创建时间与
+// 结束时间仍保持操作前内容：仍有效的方案继续按当前持有、账户状态与时间
+// 显示并接受原本允许的答复，继续阻止另一份有效方案的创建，意向历史不
+// 出现这次撤回；后续其他操作成功保存也不会把这次未保存的撤回状态、记录
+// 或请求结果带入登记册。保存条件恢复后用原请求号和完全相同的内容重提，
+// 按当时的意向状态重新处理（首次重新成功不标回放；期间已到期或失效则
+// 返回原有的对应拒绝），首次真正保存成功或保存拒绝之后，后续相同请求才
+// 回放该结果。撤回不改变藏品持有、版本与版税应付。
 func (r *Registry) WithdrawSplitIntent(req WithdrawSplitIntentRequest) (WithdrawSplitIntentResult, error) {
 	missing := []string{}
 	if strings.TrimSpace(req.Operator) == "" {
@@ -605,7 +613,10 @@ func (r *Registry) WithdrawSplitIntent(req WithdrawSplitIntentRequest) (Withdraw
 	if rec.InitiatorID != req.Operator {
 		bizErr := fmt.Errorf("%w: 只有发起人 %s 可以撤回意向 %s",
 			ErrForbidden, rec.InitiatorID, req.IntentID)
-		r.recordIntentRequest(key, sig, req.Operator, req.RequestID, "intent_withdraw", req.IntentID, bizErr)
+		if err := r.saveIntentRequestRejection(key, sig, req.Operator, req.RequestID,
+			"intent_withdraw", req.IntentID, bizErr); err != nil {
+			return WithdrawSplitIntentResult{}, err
+		}
 		return WithdrawSplitIntentResult{IntentID: req.IntentID, Err: bizErr}, bizErr
 	}
 	status := r.intentCurrentStatus(rec, now)
@@ -617,19 +628,34 @@ func (r *Registry) WithdrawSplitIntent(req WithdrawSplitIntentRequest) (Withdraw
 			Params: sig, IntentID: req.IntentID, Status: SplitWithdrawn,
 		}
 		if err := r.commit(); err != nil {
+			// 幂等撤回只登记请求结果、不改动意向与历史；保存失败且状态未能
+			// 按磁盘重建时，显式撤销未保存的请求号占用，整体返回空结果与
+			// 实际保存错误，不能把此前已保存的"已撤回"当成这次操作的结果。
+			delete(r.state.Requests, key)
 			return WithdrawSplitIntentResult{}, err
 		}
 		return WithdrawSplitIntentResult{IntentID: req.IntentID, Status: SplitWithdrawn}, nil
 	case SplitRejected, SplitInvalid, SplitExpired:
 		bizErr := intentEndedErr(status, req.IntentID)
-		r.recordIntentRequest(key, sig, req.Operator, req.RequestID, "intent_withdraw", req.IntentID, bizErr)
+		if err := r.saveIntentRequestRejection(key, sig, req.Operator, req.RequestID,
+			"intent_withdraw", req.IntentID, bizErr); err != nil {
+			return WithdrawSplitIntentResult{}, err
+		}
 		return WithdrawSplitIntentResult{IntentID: req.IntentID, Err: bizErr}, bizErr
 	}
 
+	// 回滚基点：保存失败且磁盘暂时不可读、状态未能按磁盘重建时，本次未
+	// 保存的撤回状态、结束时间、撤回记录、意向历史序号与请求号占用都必须
+	// 显式撤销，否则同一个仍打开的登记册会把仍有效的方案显示为已撤回，
+	// 参与账户无法继续答复、还可能另建一份有效方案；后续任何一次成功保存
+	// 也会把这份未保存的撤回带进登记册。
+	prevIntentSeq := r.state.NextIntentSeq
+	prevEvents := len(r.state.IntentEvents)
+	prevRec := rec
 	rec.Status = "withdrawn"
 	rec.EndedAt = now
 	r.state.Intents[req.IntentID] = rec
-	seq := r.state.NextIntentSeq + 1
+	seq := prevIntentSeq + 1
 	r.state.NextIntentSeq = seq
 	r.state.IntentEvents = append(r.state.IntentEvents, intentEvent{
 		Seq: seq, IntentID: req.IntentID, ItemID: rec.ItemID, Kind: "withdraw",
@@ -641,6 +667,16 @@ func (r *Registry) WithdrawSplitIntent(req WithdrawSplitIntentRequest) (Withdraw
 		Params: sig, IntentID: req.IntentID, Status: SplitWithdrawn,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已随旧
+		// 状态整体撤销（请求记录不存在），无需再动；磁盘暂时不可读、状态
+		// 未能重建时请求记录仍在，据此把本次未保存的改动全部撤销——意向
+		// 恢复为操作前的状态、答复与结束时间，历史与序号回退，请求号释放。
+		if _, ok := r.state.Requests[key]; ok {
+			delete(r.state.Requests, key)
+			r.state.Intents[req.IntentID] = prevRec
+			r.state.IntentEvents = r.state.IntentEvents[:prevEvents]
+			r.state.NextIntentSeq = prevIntentSeq
+		}
 		return WithdrawSplitIntentResult{}, err
 	}
 	return WithdrawSplitIntentResult{IntentID: req.IntentID, Status: SplitWithdrawn}, nil
