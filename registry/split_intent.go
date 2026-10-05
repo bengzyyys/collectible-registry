@@ -154,6 +154,16 @@ func createIntentParamsSig(req CreateSplitIntentRequest, shares []intentShare) s
 // 请求号与发行、转让等操作共用同一操作者的请求号范围：相同业务参数
 // （份额名单仅排列不同视为相同）重提返回首次结果，参数不同返回
 // ErrRequestConflict；参数错误与引用不存在不占用请求号。
+//
+// 成功与状态类拒绝都以保存完成为准：本次结果尚未写入原登记册而保存失败
+// （如数据位置暂时无法写入）时，返回实际保存错误，不报告创建成功，也不
+// 只返回原业务拒绝；结果为空（意向编号与状态为空、绑定版本为零、不标
+// 回放、业务错误为空），error 说明保存失败。即使失败后原数据暂时无法
+// 读取、状态未能按磁盘重建，这次操作也不留下任何新增意向、创建记录或
+// 请求号占用，意向历史序号不被消耗，后续其他操作成功保存也不会把这次
+// 未保存的内容带进登记册。保存条件恢复后用完全相同的请求重提，按当时
+// 的业务状态重新判断：拒绝条件仍在则重新保存此次拒绝并返回对应业务
+// 错误（首次重提不标回放），状态已满足请求且方案仍未到期则正常创建。
 func (r *Registry) CreateSplitIntent(req CreateSplitIntentRequest) (CreateSplitIntentResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return CreateSplitIntentResult{}, err
@@ -186,7 +196,17 @@ func (r *Registry) CreateSplitIntent(req CreateSplitIntentRequest) (CreateSplitI
 				Params: sig, Rejected: true, Reason: errCode(bizErr),
 				IntentID: req.IntentID, ItemID: req.ItemID,
 			}
-			_ = r.commit()
+			if err := r.commit(); err != nil {
+				// 拒绝结果落盘失败：这次拒绝没有被记住，与发行、转让、创建
+				// 授权一致——不能只用业务错误掩盖保存错误，调用者稍后用原
+				// 请求重提时必须按当时状态重新判断，而不是回放一个实际没有
+				// 保存的拒绝。commit 失败时已按磁盘内容重建状态，请求记录
+				// 随之撤销；此处再删一次以覆盖磁盘暂时不可读、状态未能重建
+				// 的情形。整体返回空结果：意向编号与状态为空、绑定版本为
+				// 零、不标回放、结果中业务错误为空，error 保留实际写入错误。
+				delete(r.state.Requests, key)
+				return CreateSplitIntentResult{}, err
+			}
 		}
 		return CreateSplitIntentResult{IntentID: req.IntentID, Err: bizErr}, bizErr
 	}
@@ -203,9 +223,14 @@ func (r *Registry) CreateSplitIntent(req CreateSplitIntentRequest) (CreateSplitI
 		Shares: shares, GrantVer: h.Version, ExpiresAt: req.ExpiresAt,
 		CreatedAt: now,
 	}
+	// 回滚基点：保存失败且磁盘暂时不可读、状态未能按磁盘重建时，本次
+	// 未保存的意向、创建记录与请求号占用都必须显式撤销，否则后续任何
+	// 一次成功保存都会把这份未保存的意向带进登记册。
+	prevIntentSeq := r.state.NextIntentSeq
+	prevEvents := len(r.state.IntentEvents)
 	r.state.Intents[req.IntentID] = rec
 	status := r.intentCurrentStatus(rec, now)
-	seq := r.state.NextIntentSeq + 1
+	seq := prevIntentSeq + 1
 	r.state.NextIntentSeq = seq
 	r.state.IntentEvents = append(r.state.IntentEvents, intentEvent{
 		Seq: seq, IntentID: req.IntentID, ItemID: req.ItemID, Kind: "create",
@@ -218,6 +243,15 @@ func (r *Registry) CreateSplitIntent(req CreateSplitIntentRequest) (CreateSplitI
 		Version: h.Version, Status: status,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已
+		// 随旧状态整体撤销（请求记录不存在），无需再动；磁盘暂时不可读、
+		// 状态未能重建时请求记录仍在，据此把本次未保存的改动全部撤销。
+		if _, ok := r.state.Requests[key]; ok {
+			delete(r.state.Requests, key)
+			delete(r.state.Intents, req.IntentID)
+			r.state.IntentEvents = r.state.IntentEvents[:prevEvents]
+			r.state.NextIntentSeq = prevIntentSeq
+		}
 		return CreateSplitIntentResult{}, err
 	}
 	return CreateSplitIntentResult{IntentID: req.IntentID, Status: status, GrantVer: h.Version}, nil
