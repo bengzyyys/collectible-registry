@@ -687,6 +687,153 @@ func TestSplitIntentPersistence(t *testing.T) {
 	}
 }
 
+// ---- 查询结果隔离 ----
+
+// wantInitialParties 返回该方案登记时的原始参与名单：按账户编号排列，
+// 发起人 alice 创建即视为同意，bob、carol 尚未答复。
+func wantInitialParties() []SplitParty {
+	return []SplitParty{
+		{AccountID: "alice", Share: 5000, Answer: SplitAnswerAgree},
+		{AccountID: "bob", Share: 3000},
+		{AccountID: "carol", Share: 2000},
+	}
+}
+
+func cloneParties(in SplitIntent) []SplitParty {
+	out := make([]SplitParty, len(in.Shares))
+	copy(out, in.Shares)
+	return out
+}
+
+func assertParties(t *testing.T, got []SplitParty, want []SplitParty, ctx string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: party count %d, want %d: %+v", ctx, len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s: party %d = %+v, want %+v (full: %+v)", ctx, i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestGetSplitIntentResultIsolation 锁定一条数据隔离规则：每次查询返回的
+// 都是独立于登记册、也独立于其他查询结果的副本。调用者为展示而本地改动
+// 返回名单（账户、份额、答复、顺序）只影响自己手里那份数据——既不能成为
+// 有效答复，也不能在后来的查询或他人保留的旧结果中改写登记的方案；后来
+// 的真实答复同样不会回写调用者此前保留的快照。
+func TestGetSplitIntentResultIsolation(t *testing.T) {
+	r := mustCreate(t, tempDir(t))
+	intentWorld(t, r)
+	if _, err := r.CreateSplitIntent(createIntentReq(r, "sp1")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第一次查询并原样保留（模拟另一位调用者此前取得后未作改动的结果）。
+	first, err := r.GetSplitIntent("sp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != SplitPending {
+		t.Fatalf("initial intent must be pending: %+v", first)
+	}
+	wantInitial := wantInitialParties()
+	assertParties(t, first.Shares, wantInitial, "首次查询")
+	kept := cloneParties(first)
+
+	// 第二次查询，调用者在本地任意篡改这份返回内容：
+	//  - 把 bob 伪造成"同意"，并把 carol 伪造成"拒绝"；
+	//  - 用名单外、但已登记可用的 dave 替换原参与账户 carol；
+	//  - 改动份额使合计不再是 10000；
+	//  - 重排名单顺序。
+	local, err := r.GetSplitIntent("sp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	local.Shares[0].Answer = SplitAnswerReject                          // 篡改发起人答复
+	local.Shares[1].Answer = SplitAnswerAgree                           // 本地给 bob 填"同意"
+	local.Shares[2].AccountID = "dave"                                  // 用名单外账户替换 carol
+	local.Shares[2].Answer = SplitAnswerReject                          // 本地给 dave 填"拒绝"
+	local.Shares[1].Share = 9000                                        // 破坏份额合计
+	local.Shares[0], local.Shares[1] = local.Shares[1], local.Shares[0] // 打乱顺序
+
+	// 无论本地改动是否仍符合原方案要求，下一次查询都返回原先登记的账户、
+	// 份额、答复与按账户编号排列的顺序，且仍为待确认。
+	again, err := r.GetSplitIntent("sp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Status != SplitPending {
+		t.Fatalf("本地改动后重查必须仍为待确认: %+v", again)
+	}
+	assertParties(t, again.Shares, wantInitial, "本地篡改后重查")
+
+	// 先前另一次查询保留的结果不能跟着本地改动变化。
+	assertParties(t, first.Shares, wantInitial, "先前保留的查询结果")
+	assertParties(t, kept, wantInitial, "先前保留的名单副本")
+
+	// 本地伪造的答复不是有效答复：被本地加入、实际不在登记名单的 dave
+	// 提交答复，仍按既有无权答复拒绝。
+	if _, err := r.AnswerSplitIntent(answerReq("dave", "sp1", "ans-dave", true)); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("名单外账户答复必须按无权拒绝: %v", err)
+	}
+
+	// 原名单中尚未答复的 bob 能按原份额正常同意，不应被本地伪造的"同意"
+	// 当作已答复过（否则会落到重复答复分支，行为与事件均不同）。
+	res, err := r.AnswerSplitIntent(answerReq("bob", "sp1", "ans-bob", true))
+	if err != nil || res.Status != SplitPending || res.Replayed {
+		t.Fatalf("bob 首次真实同意应生效且仍待确认: %+v %v", res, err)
+	}
+
+	// 真实同意后重查：只显示 bob 这一名的新答复，carol 仍为空，整体待确认，
+	// 账户、份额与排序维持原登记方案（carol 没有被本地替换成 dave）。
+	after, err := r.GetSplitIntent("sp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != SplitPending {
+		t.Fatalf("仅一方同意后必须仍为待确认，本地伪造不能让全员视为已同意: %+v", after)
+	}
+	wantAfter := []SplitParty{
+		{AccountID: "alice", Share: 5000, Answer: SplitAnswerAgree},
+		{AccountID: "bob", Share: 3000, Answer: SplitAnswerAgree},
+		{AccountID: "carol", Share: 2000},
+	}
+	assertParties(t, after.Shares, wantAfter, "真实同意后重查")
+
+	// 后来的真实答复不能回写此前保留、且未自行改写的查询结果：它仍呈现
+	// 查询当时 bob、carol 均未答复的内容。
+	assertParties(t, first.Shares, wantInitial, "真实答复后旧快照必须保持当时内容")
+	assertParties(t, kept, wantInitial, "真实答复后旧名单副本必须保持当时内容")
+
+	// 整个过程只记录拆分约定：藏品持有人与持有版本维持原值，藏品历史不变。
+	h, _ := r.GetHolding("i1")
+	if h.OwnerID != "alice" || h.Version != 1 {
+		t.Fatalf("查询与本地编辑不能改变持有: %+v", h)
+	}
+	if hist, _ := r.History("i1"); len(hist) != 1 {
+		t.Fatalf("查询与本地编辑不能增加藏品历史: %d", len(hist))
+	}
+
+	// 查询和本地编辑不产生任何意向事件；只有 bob 刚才真实提交的首次答复
+	// 在创建事件之外新增一条 answer 记录（dave 的无权答复也不落事件）。
+	evs, err := r.SplitIntentHistory("i1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("意向历史应只有创建+一次真实答复，got %d: %+v", len(evs), evs)
+	}
+	if evs[0].Kind != "create" {
+		t.Fatalf("首条事件应为创建: %+v", evs[0])
+	}
+	if e := evs[1]; e.Kind != "answer" || e.Operator != "bob" ||
+		e.Answer != SplitAnswerAgree || e.RequestID != "ans-bob" ||
+		e.FromStatus != SplitPending || e.ToStatus != SplitPending {
+		t.Fatalf("第二条事件应为 bob 的首次同意: %+v", e)
+	}
+}
+
 // 手写一份引入拆分意向之前的旧格式快照（没有 intents 等新字段）：旧登记册
 // 必须能直接打开，意向查询按不存在处理，新意向可正常创建。
 func TestSplitIntentLegacyRegistry(t *testing.T) {
