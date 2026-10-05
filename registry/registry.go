@@ -293,6 +293,16 @@ func issueParamsSig(req IssueRequest) string {
 // 操作者必须是系列创建账户且可用，初始持有人必须已登记且可用，系列未
 // 封存，藏品编号从未使用过。同一 (操作者, 请求号) 且业务参数相同的
 // 重复提交返回首次结果；参数不同返回 ErrRequestConflict。
+//
+// 状态类拒绝的落盘失败时，与整批发行一致：返回保存错误（保留实际写入
+// 错误）而非该业务错误，结果为空（无藏品编号、无持有人、无版本、无历史
+// 序号、业务错误为空、不标回放），请求号不被这次未保存的拒绝占用，不
+// 登记藏品、不建立持有、不追加发行历史、不消耗历史序号，未首次发行的
+// 系列也不因此固定版税规则；保存条件恢复后用完全相同的请求重提，按当时
+// 的业务状态重新判断：拒绝条件仍在则重新保存此次拒绝并返回对应业务错误
+// （这次不算回放），调用者也可修正原请求（如更换停用的初始持有人）后用
+// 同一请求号正常发行。参数错误与引用不存在不占用请求号，仍直接返回原
+// 错误，不受保存故障影响。
 func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return IssueResult{}, err
@@ -319,7 +329,18 @@ func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 				Params: sig, Rejected: true, Reason: errCode(bizErr),
 				ItemID: req.ItemID,
 			}
-			_ = r.commit()
+			if err := r.commit(); err != nil {
+				// 拒绝结果落盘失败：这次拒绝没有被记住，与整批发行一致——
+				// 不能只用业务错误掩盖保存错误，调用者稍后用原请求重提时
+				// 必须按当时状态重新判断，而不是回放一个实际没有保存的
+				// 拒绝。commit 失败时已按磁盘内容重建状态，请求记录随之
+				// 撤销；此处再删一次以覆盖磁盘暂时不可读、状态未能重建
+				// 的情形。整体返回空结果：无藏品编号、无持有人、无版本、
+				// 无历史序号、不标回放、结果中业务错误为空，error 保留
+				// 实际写入错误。
+				delete(r.state.Requests, key)
+				return IssueResult{}, err
+			}
 		}
 		// 校验类错误（引用不存在等）不占用请求号，也不改变任何状态。
 		return IssueResult{ItemID: req.ItemID, Err: bizErr}, bizErr
