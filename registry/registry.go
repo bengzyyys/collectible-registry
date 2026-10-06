@@ -488,6 +488,21 @@ func (r *Registry) applyTransfer(itemID, toID, operator, reason, requestID, auth
 // 保存条件恢复后用完全相同的请求重提，按当时的业务状态重新判断：拒绝
 // 条件仍在则重新保存此次拒绝并返回对应业务错误，状态已变为满足请求则
 // 正常转出。
+//
+// 成功转让同样以保存完成为准：持有换人、版本加一、转让历史、版税应付、
+// 历史序号与请求结果都尚未写入原登记册而保存失败（如数据位置暂时无法
+// 写入）时，返回实际保存错误而非转让成功，结果为空（不携带藏品编号、前后
+// 持有人、版本、历史序号、价款、应付或余款，业务错误为空，不标回放）。
+// 即使失败后原数据暂时无法读取、状态未能按磁盘重建，这笔转让也必须从当前
+// 仍打开的登记册中整体撤销：藏品仍属于提交前的持有人、版本不增加、持有
+// 列表与藏品历史保持原状、版税查询没有本次计算记录、收款账户不多出应付，
+// 请求号与历史序号都不被消耗；失败前已存在的成功转让、应付与其他藏品记录
+// 原样保留，随后另一次无关操作成功保存也不会把这笔未保存的转让一并写入。
+// 读写条件恢复后用原操作者、请求号、原因和全部转让参数重新提交，按当时的
+// 持有与账户状态重新判断：条件仍满足时正常完成一次转让（版本只增加一次、
+// 序号紧接已有历史、不标回放），此后再次提交相同内容才回放这一笔已保存的
+// 结果；恢复期间藏品已被另一笔合法转让转出的，原请求按现有版本冲突规则
+// 拒绝，不能回放先前未保存的成功。
 func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return TransferResult{}, err
@@ -531,6 +546,15 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		return TransferResult{ItemID: req.ItemID, Err: bizErr}, bizErr
 	}
 
+	// 回滚基点：本次成功转让的全部改动（持有换人、版本加一、历史、版税
+	// 应付、历史序号、请求结果）都必须以一次保存完成为准。记录改动前的
+	// 持有、历史长度与历史序号，保存失败且磁盘暂时不可读、状态未能按磁盘
+	// 重建时据此整体撤销，否则后续任何一次成功保存都会把这笔未保存的转让
+	// 带进登记册，造成"已换人、可回放"的幻影交易。
+	prevHolding := r.state.Holdings[req.ItemID]
+	prevNextSeq := r.state.NextSeq
+	prevHistLen := len(r.state.History)
+
 	// 持有变化、历史、版税应付与请求结果在同一临界区内一次落盘。
 	out := r.applyTransfer(req.ItemID, req.ToID, req.Operator, req.Reason, req.RequestID, "", req.Price)
 	r.state.Requests[key] = request{
@@ -539,6 +563,20 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		Version: out.toVer(), TxSeq: out.seq,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已随
+		// 旧状态整体撤销（持有未换人、无本次历史与应付、请求记录不存在、
+		// 序号未消耗），无需再动；磁盘暂时不可读、状态未能重建时本次改动
+		// 仍在，据此把这笔未保存的转让全部撤销，让当前已打开的登记册回到
+		// 提交前状态，也不被随后另一次成功保存带入。返回空结果：无藏品
+		// 编号、无前后持有人、无版本、无历史序号、无价款/应付/余款、不标
+		// 回放、结果中业务错误为空，error 保留实际写入错误。
+		if _, pending := r.state.Requests[key]; pending {
+			delete(r.state.Requests, key)
+			delete(r.state.Royalties, out.seq)
+			r.state.History = r.state.History[:prevHistLen]
+			r.state.Holdings[req.ItemID] = prevHolding
+			r.state.NextSeq = prevNextSeq
+		}
 		return TransferResult{}, err
 	}
 	return TransferResult{ItemID: req.ItemID, FromID: out.fromID, ToID: req.ToID,
