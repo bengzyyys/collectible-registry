@@ -234,6 +234,18 @@ func (r *Registry) CreateSeries(id, creatorID, metadata string) error {
 
 // SealSeries 封存系列。只有系列创建账户可以封存；封存后不能继续发行，
 // 已发行藏品仍可转让，且封存不能撤销。
+//
+// 封存以一次保存完成为准：封存状态尚未原子替换原数据就发生写入错误（如
+// 数据位置暂时无法写入）时，返回本次实际的保存错误，不返回成功，也不能用
+// 失败后重新读取原数据时的错误取代它。即使原数据仍在、却暂时无法读取或
+// 解析、状态未能按磁盘重建，同一个仍打开的登记册也必须保持封存前的样子：
+// 该系列编号、创建账户、文字元数据不变且仍未封存，满足原有发行条件时仍可
+// 发行；其已发行藏品的持有人、版本与发行、转让历史原样保留；其他系列此前
+// 已经成功封存的封存状态不被解封。原数据仍可读取的普通保存失败同样撤销
+// 本次变化，不依赖重新读取成功。保存条件未恢复时再次提交封存须重新尝试
+// 保存并返回本次保存错误，不能因上次失败留下的状态直接宣告完成；随后另
+// 一次无关操作成功保存也不会把这次未保存的封存夹带落盘。读写恢复后重新
+// 提交封存，成功保存后才显示已封存，并按原有规则拒绝单件与整批发行。
 func (r *Registry) SealSeries(seriesID, operator string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -248,11 +260,24 @@ func (r *Registry) SealSeries(seriesID, operator string) error {
 		return fmt.Errorf("%w: 只有创建账户 %s 可以封存系列 %s", ErrForbidden, s.CreatorID, seriesID)
 	}
 	if s.Sealed {
-		return nil // 封存不可撤销，重复封存视为已处于封存态
+		return nil // 封存不可撤销，已成功封存的系列重复封存直接成功，不要求再次写入
 	}
+	// 保存封存前的系列记录：封存以一次保存完成为准。commit 失败且磁盘
+	// 暂时不可读、状态未能按磁盘重建时据此显式撤销，否则这次未保存的封存
+	// 会留在当前已打开的登记册中（GetSeries 显示已封存、发行被按封存拒绝、
+	// 重复封存被幂等分支直接放行），并被随后另一次成功保存夹带落盘。
+	prev := s
 	s.Sealed = true
 	r.state.Series[seriesID] = s
-	return r.commit()
+	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则系列已随旧状态
+		// 整体恢复未封存，写回的记录与磁盘一致；磁盘暂时不可读、状态未能
+		// 重建时本次封存仍在，显式恢复为封存前记录，藏品持有、版本与历史
+		// 本就未被触碰。返回实际写入错误，而非成功或重新读取时的错误。
+		r.state.Series[seriesID] = prev
+		return err
+	}
+	return nil
 }
 
 // GetSeries 查询系列；不存在时返回包裹 ErrNotFound 的错误。
