@@ -488,6 +488,16 @@ func (r *Registry) applyTransfer(itemID, toID, operator, reason, requestID, auth
 // 保存条件恢复后用完全相同的请求重提，按当时的业务状态重新判断：拒绝
 // 条件仍在则重新保存此次拒绝并返回对应业务错误，状态已变为满足请求则
 // 正常转出。
+//
+// 成功转让同样以保存完成为准：本次内容尚未替换原有数据而保存失败（如
+// 数据位置暂时无法写入）时，返回实际保存错误，不报告转让成功；结果为空
+// （无藏品编号、无前后持有人、无版本、无历史序号、无价款的应付与余款、
+// 业务错误为空、不标回放）。即使失败后原数据暂时无法读取、状态未能按
+// 磁盘重建，这次操作也不留下任何持有变化、转让历史、版税应付或请求号
+// 占用，历史序号不被消耗，后续其他操作成功保存也不会把这次未保存的
+// 转让带进登记册。保存条件恢复后用完全相同的请求重提，按当时的持有与
+// 账户状态重新判断：条件仍满足则正常完成一次转让（不标回放），藏品
+// 已易手则按现有版本冲突规则拒绝，不能回放先前未保存的成功。
 func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return TransferResult{}, err
@@ -532,6 +542,13 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 	}
 
 	// 持有变化、历史、版税应付与请求结果在同一临界区内一次落盘。
+	// 回滚基点：保存失败且磁盘暂时不可读、状态未能按磁盘重建时，本次
+	// 未保存的持有变化、转让历史、版税应付与请求号占用都必须显式撤销，
+	// 否则后续查询会看到藏品已换人，后续任何一次成功保存也会把这笔
+	// 未保存的转让带进登记册。
+	prevSeq := r.state.NextSeq
+	prevHistLen := len(r.state.History)
+	prevHolding := r.state.Holdings[req.ItemID]
 	out := r.applyTransfer(req.ItemID, req.ToID, req.Operator, req.Reason, req.RequestID, "", req.Price)
 	r.state.Requests[key] = request{
 		Operator: req.Operator, RequestID: req.RequestID, Kind: "transfer",
@@ -539,6 +556,16 @@ func (r *Registry) Transfer(req TransferRequest) (TransferResult, error) {
 		Version: out.toVer(), TxSeq: out.seq,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已
+		// 随旧状态整体撤销（请求记录不存在），无需再动；磁盘暂时不可读、
+		// 状态未能重建时请求记录仍在，据此把本次未保存的改动全部撤销。
+		if _, ok := r.state.Requests[key]; ok {
+			delete(r.state.Requests, key)
+			r.state.Holdings[req.ItemID] = prevHolding
+			r.state.History = r.state.History[:prevHistLen]
+			r.state.NextSeq = prevSeq
+			delete(r.state.Royalties, out.seq)
+		}
 		return TransferResult{}, err
 	}
 	return TransferResult{ItemID: req.ItemID, FromID: out.fromID, ToID: req.ToID,
