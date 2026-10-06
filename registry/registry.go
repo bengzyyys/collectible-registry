@@ -149,6 +149,17 @@ func (r *Registry) RegisterAccount(id, metadata string) error {
 
 // DeactivateAccount 停用账户。停用后其原有藏品与历史仍可查询，但不能
 // 再发行、发起或接收新的转让；停用不影响已经落盘的任何记录。
+//
+// 停用以保存成功为准：停用状态尚未原子替换原数据就发生写入错误（如数据
+// 位置暂时无法写入）时，返回本次实际的保存错误，不返回成功，也不能用失败
+// 后重新读取原数据时的错误取代它。即使原数据仍在、却暂时无法读取或解析、
+// 状态未能按磁盘重建，同一个仍打开的登记册也必须保持停用前的样子：该账户
+// 仍可用，编号与元数据不变，其已有藏品的持有人、版本与历史原样保留；其他
+// 账户此前已经成功停用的状态不被恢复为可用。原数据仍可读取的普通保存失败
+// 同样撤销本次变化，不依赖重新读取成功。随后另一次无关操作成功保存也不会
+// 把这次未保存的停用夹带落盘。保存条件恢复后该账户仍按原有规则参与转让；
+// 之后再次提交停用须重新完成保存，成功返回后才显示不可用，并按现有规则
+// 拒绝其发起或接收新的转让。
 func (r *Registry) DeactivateAccount(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -160,11 +171,24 @@ func (r *Registry) DeactivateAccount(id string) error {
 		return fmt.Errorf("%w: 账户 %s", ErrNotFound, id)
 	}
 	if !a.Active {
-		return nil // 停用是幂等的终态
+		return nil // 停用是幂等的终态，已停用直接成功，不要求再次写入
 	}
+	// 保存停用前的账户记录：停用以一次保存完成为准。commit 失败且磁盘
+	// 暂时不可读、状态未能按磁盘重建时据此显式撤销，否则这次未保存的停用
+	// 会留在当前已打开的登记册中（GetAccount 显示不可用、转让被按停用
+	// 拒绝），并被随后另一次成功保存夹带落盘。
+	prev := a
 	a.Active = false
 	r.state.Accounts[id] = a
-	return r.commit()
+	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则账户已随旧状态
+		// 整体恢复可用，写回的记录与磁盘一致；磁盘暂时不可读、状态未能重建
+		// 时本次停用仍在，显式恢复为停用前记录，藏品持有、版本与历史本就未
+		// 被触碰。返回实际写入错误，而非成功或重新读取时的错误。
+		r.state.Accounts[id] = prev
+		return err
+	}
+	return nil
 }
 
 // GetAccount 查询账户；账户不存在时返回包裹 ErrNotFound 的错误。
