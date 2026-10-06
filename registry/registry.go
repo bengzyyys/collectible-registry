@@ -1025,12 +1025,28 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 
 	if bizErr := r.checkProxyTransfer(req, now); bizErr != nil {
 		if !isValidationErr(bizErr) {
+			// 状态类业务拒绝（无权、已撤销、已到期、已使用、账户停用、
+			// 持有版本不符）占用请求号并落盘，相同参数重提返回这一次拒绝。
 			r.state.Requests[key] = request{
 				Operator: req.Operator, RequestID: req.RequestID, Kind: "proxy_transfer",
 				Params: sig, Rejected: true, Reason: errCode(bizErr), AuthID: req.AuthID,
 			}
-			_ = r.commit()
+			if err := r.commit(); err != nil {
+				// 拒绝结果落盘失败：这次拒绝没有被记住，与单件转让一致——
+				// 不能只用到期、无权或停用等业务错误掩盖保存错误，调用者
+				// 稍后用原请求重提时必须按当时状态重新判断，而不是回放一个
+				// 实际没有保存的拒绝。commit 失败时已按磁盘内容重建状态，
+				// 请求记录随之撤销；此处再删一次以覆盖磁盘暂时不可读、状态
+				// 未能重建的情形。整体返回空结果：无授权或藏品编号、无转让
+				// 与金额信息、不标回放、结果中业务错误为空，error 保留实际
+				// 写入错误。未保存的拒绝不改变授权内容、使用标记、授权变更
+				// 记录、藏品持有、版本、历史与版税应付。
+				delete(r.state.Requests, key)
+				return ProxyTransferResult{}, err
+			}
 		}
+		// 授权、账户或藏品不存在等校验错误不占用请求号，也不改变持有、
+		// 授权状态或历史。
 		return ProxyTransferResult{AuthID: req.AuthID, Err: bizErr}, bizErr
 	}
 
