@@ -108,6 +108,24 @@ func transferBatchParamsSig(req TransferBatchRequest) string {
 // 请求号不被这次未保存的拒绝占用；保存条件恢复后用完全相同的请求重提，
 // 按当时的业务状态重新判断：拒绝条件仍在则重新保存此次拒绝并返回对应
 // 业务错误，状态已变为满足请求则整批正常执行。
+//
+// 整批成功同样以一次保存完成为准：全部条目的持有换人、版本加一、转让
+// 历史、版税应付、历史序号与请求结果都尚未原子替换原数据就发生保存错误
+// （如数据位置暂时无法写入）时，返回实际保存错误而非整批成功，结果为空
+// （不携带任何转让条目、失败藏品编号或业务错误，不标回放）。即使失败后
+// 旧数据仍在却暂时无法读取或解析、状态未能按磁盘重建，这批转让也必须从
+// 当前仍打开的登记册中整体撤销：清单内每件仍归提交前的持有人、版本不增加、
+// 各账户持有列表与藏品历史保持原样，本次计算出的版税应付与余款不留存
+// （按本次转让序号查版税返回对象不存在，收款账户的应付列表不多出明细），
+// 请求号与历史序号都不被消耗；失败前已保存的历史、应付、系列规则以及清单
+// 外藏品的持有人和版本完整保留，不会因撤销本批而删掉旧记录。保存条件尚未
+// 恢复时用完全相同的请求再次提交，仍实际尝试保存并返回当次保存错误，不能
+// 回放未保存的成功；随后另一项无关操作成功保存也不会把这批未保存的持有
+// 变化、历史、应付或请求结果一并写入。读写恢复后用原请求号、原因和完整
+// 清单重提，账户与持有条件仍满足时整批正常执行一次，各件版本只增加一次，
+// 历史序号紧接已有记录，结果不标回放，此后相同提交才回放这次已保存的结果；
+// 若其中一件已被另一笔合法转让转出，原整批按现有持有版本规则拒绝，其余
+// 条目不发生转让。原数据仍可读取时的保存失败行为相同。
 func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return TransferBatchResult{}, err
@@ -151,6 +169,19 @@ func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult,
 		return TransferBatchResult{ItemID: itemID, Err: bizErr}, bizErr
 	}
 
+	// 回滚基点：本次整批成功的全部改动（每件持有换人、版本加一、转让历史、
+	// 版税应付、历史序号、请求结果）都必须以一次保存完成为准。记录改动前
+	// 每件的持有、历史长度与历史序号；保存失败且磁盘暂时不可读、状态未能
+	// 按磁盘重建时据此整体撤销，否则后续任何一次成功保存都会把这批未保存
+	// 的转让带进登记册，造成"已换人、可回放"的幻影整批。
+	prevHoldings := make(map[string]holding, len(req.Entries))
+	txSeqs := make([]int64, 0, len(req.Entries))
+	for _, e := range req.Entries {
+		prevHoldings[e.ItemID] = r.state.Holdings[e.ItemID]
+	}
+	prevNextSeq := r.state.NextSeq
+	prevHistLen := len(r.state.History)
+
 	// 在同一临界区内按清单顺序依次转让：各件版本分别加一、历史序号连续，
 	// 与其他整批、单件转让、代转或发行互斥，整批记录之间不会插入别的记录。
 	// 各件沿用与单件转让相同的持有、历史与版税落盘逻辑；同一收款账户在
@@ -159,6 +190,7 @@ func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult,
 	stored := make([]batchTransferItemResult, 0, len(req.Entries))
 	for _, e := range req.Entries {
 		out := r.applyTransfer(e.ItemID, e.ToID, req.Operator, req.Reason, req.RequestID, "", e.Price)
+		txSeqs = append(txSeqs, out.seq)
 		items = append(items, TransferBatchItem{
 			ItemID: e.ItemID, FromID: out.fromID, ToID: e.ToID, Version: out.toVer(),
 			TxSeq: out.seq, Price: out.royalty.Price, Payables: publicPayables(out.royalty.Payees),
@@ -176,6 +208,23 @@ func (r *Registry) TransferBatch(req TransferBatchRequest) (TransferBatchResult,
 		Params: sig, TransferBatch: stored,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次整批改动已随
+		// 旧状态整体撤销（持有未换人、无本次历史与应付、请求记录不存在、
+		// 序号未消耗），无需再动；磁盘暂时不可读或无法解析、状态未能重建时
+		// 本次改动仍在，据此把这批未保存的转让全部撤销，让当前已打开的登记
+		// 册回到提交前状态，也不被随后另一次成功保存带入。返回空结果：无转让
+		// 条目、无失败藏品编号、无业务错误、不标回放，error 保留实际写入错误。
+		if _, pending := r.state.Requests[key]; pending {
+			delete(r.state.Requests, key)
+			for _, seq := range txSeqs {
+				delete(r.state.Royalties, seq)
+			}
+			r.state.History = r.state.History[:prevHistLen]
+			for itemID, h := range prevHoldings {
+				r.state.Holdings[itemID] = h
+			}
+			r.state.NextSeq = prevNextSeq
+		}
 		return TransferBatchResult{}, err
 	}
 	return TransferBatchResult{Items: items}, nil

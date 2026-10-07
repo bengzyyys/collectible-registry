@@ -604,3 +604,222 @@ func TestTransferBatchValidationErrorIgnoresSaveFailure(t *testing.T) {
 	}
 	assertRequestFree(t, r, badReq, 5)
 }
+
+// 以下用例补充"旧数据仍在却暂时无法读取或解析"的整批保存失败：save 在
+// rename 之前失败的同时，把 registry.json 改写为无法解析的内容，使 commit
+// 无法按磁盘重建内存状态。整批是否回到提交前状态不能依赖重新读取旧数据
+// 成功——回滚必须在当前仍打开的登记册上同样成立。
+
+// corruptBatchData 把数据文件改写为无法解析的内容，返回改写前的原文件内容
+// 供恢复时写回；与 blockBatchSave 配合模拟"写入失败且旧数据暂时不可读"。
+func corruptBatchData(t *testing.T, r *Registry) []byte {
+	t.Helper()
+	orig, err := os.ReadFile(dataFile(r.dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dataFile(r.dir), []byte("{corrupt"), fileMode); err != nil {
+		t.Fatal(err)
+	}
+	return orig
+}
+
+// restoreBatchData 写回原数据文件内容，模拟读写恢复；不改变临时文件路径上
+// 的保存阻断（需要保存恢复时另行 restoreBatchSave）。
+func restoreBatchData(t *testing.T, r *Registry, orig []byte) {
+	t.Helper()
+	if err := os.WriteFile(dataFile(r.dir), orig, fileMode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTransferBatchSaveFailureUnreadableSameRegistry 覆盖核心场景：业务检查
+// 全部通过后整批在写入阶段失败，且旧数据同时被改写为无法解析（commit 无法
+// 按磁盘重建状态）。返回保存错误与空结果；同一登记册上整批如同从未发生，
+// 旧记录完整。保存条件未恢复时重提依旧实际尝试保存并返回当次保存错误，
+// 不能回放未保存的成功。读写恢复后先做一次无关操作成功保存，也不把这批
+// 未保存的转让带入；随后原请求重提完整执行一次（非回放），再提才回放。
+func TestTransferBatchSaveFailureUnreadableSameRegistry(t *testing.T) {
+	r := mustCreate(t, tempDir(t))
+	seedBatchSaveFailureWorld(t, r)
+	req := batchSaveFailureReq()
+
+	orig := corruptBatchData(t, r)
+	blockBatchSave(t, r)
+
+	// 整批落盘失败：返回保存错误与空结果（无转让条目、无失败藏品编号、
+	// 无业务错误、不标回放）。
+	res, err := r.TransferBatch(req)
+	assertSaveFailureError(t, err)
+	if len(res.Items) != 0 || res.ItemID != "" || res.Replayed || res.Err != nil {
+		t.Fatalf("保存失败必须整体失败，不能返回任何一件已转让成功的结果: %+v", res)
+	}
+	// 即使磁盘上的旧数据无法解析，同一个已打开的登记册仍停留在整批之前。
+	assertBatchStillPending(t, r)
+
+	// 保存条件未恢复、磁盘仍不可读时再次提交同一请求：仍实际尝试保存并
+	// 返回当次保存错误，不能把上次未保存的成功当成已保存结果回放。
+	res, err = r.TransferBatch(req)
+	assertSaveFailureError(t, err)
+	if len(res.Items) != 0 || res.ItemID != "" || res.Replayed || res.Err != nil {
+		t.Fatalf("未恢复时重提仍须整体失败: %+v", res)
+	}
+	assertBatchStillPending(t, r)
+
+	// 恢复正常读写；先让一次无关操作成功保存，不能夹带这批未保存的转让。
+	restoreBatchData(t, r, orig)
+	restoreBatchSave(t, r)
+	if err := r.RegisterAccount("eve", "路人"); err != nil {
+		t.Fatalf("无关操作应能成功保存: %v", err)
+	}
+	assertBatchStillPending(t, r)
+
+	// 用原请求号、原因和完整清单重提：条件仍满足，整批完整执行一次，不标
+	// 回放；该助手同时核对序号 8/9/10、金额与应付，并确认再提才回放。
+	assertBatchRetrySuccess(t, r, req)
+
+	// 清单外藏品在失败与重试之后仍保持原状。
+	i4, _ := r.GetHolding("i4")
+	if i4.OwnerID != "bob" || i4.Version != 1 {
+		t.Fatalf("清单外 i4 最终受影响: %+v", i4)
+	}
+	i5, _ := r.GetHolding("i5")
+	if i5.OwnerID != "carol" || i5.Version != 1 {
+		t.Fatalf("清单外 i5 最终受影响: %+v", i5)
+	}
+	i6, _ := r.GetHolding("i6")
+	if i6.OwnerID != "alice" || i6.Version != 2 {
+		t.Fatalf("清单外 i6 最终受影响: %+v", i6)
+	}
+}
+
+// TestTransferBatchSaveFailureUnreadableRetryAfterReopen 覆盖磁盘视角：旧
+// 数据不可读导致的整批保存失败后，读写恢复并重新打开登记册，看到的仍是
+// 整批前状态；用原请求重提完整执行一次，而不是回放未保存的成功。
+func TestTransferBatchSaveFailureUnreadableRetryAfterReopen(t *testing.T) {
+	dir := tempDir(t)
+	r := mustCreate(t, dir)
+	t.Cleanup(func() { _ = r.Close() })
+	seedBatchSaveFailureWorld(t, r)
+	req := batchSaveFailureReq()
+
+	orig := corruptBatchData(t, r)
+	blockBatchSave(t, r)
+	res, err := r.TransferBatch(req)
+	assertSaveFailureError(t, err)
+	if len(res.Items) != 0 || res.Replayed {
+		t.Fatalf("保存失败必须整体失败: %+v", res)
+	}
+
+	// 磁盘仍损坏时重新打开应明确报 ErrCorrupt，不会被当成空登记册。
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("损坏数据文件重开应返回 ErrCorrupt: %v", err)
+	}
+
+	// 读写恢复后重新打开：内存回滚不依赖重开，磁盘上本就是整批前状态。
+	restoreBatchData(t, r, orig)
+	restoreBatchSave(t, r)
+	r2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("读写恢复后应能正常打开: %v", err)
+	}
+	t.Cleanup(func() { _ = r2.Close() })
+	assertBatchStillPending(t, r2)
+	assertBatchRetrySuccess(t, r2, req)
+}
+
+// TestTransferBatchSaveFailureUnreadableConflictOnRetry 覆盖：保存失败（旧
+// 数据不可读）后、读写恢复期间，清单中的一件被另一笔合法转让转出；原整批
+// 重提必须按现有持有版本规则拒绝（报告清单顺序最前的失败藏品），其余条目
+// 不发生转让、不消耗历史序号；该拒绝保存后，相同提交才回放这条拒绝。
+func TestTransferBatchSaveFailureUnreadableConflictOnRetry(t *testing.T) {
+	r := mustCreate(t, tempDir(t))
+	seedBatchSaveFailureWorld(t, r)
+	req := batchSaveFailureReq() // i1->carol, i2->dave, i3->alice，均期望 bob 版本 1
+
+	orig := corruptBatchData(t, r)
+	blockBatchSave(t, r)
+	res, err := r.TransferBatch(req)
+	assertSaveFailureError(t, err)
+	if len(res.Items) != 0 || res.Replayed {
+		t.Fatalf("保存失败必须整体失败: %+v", res)
+	}
+	assertBatchStillPending(t, r)
+
+	// 恢复读写后，bob 先把清单中的 i2 合法转让给 alice：i2 变为 alice
+	// 版本 2（序号 8，s2 版税 carol 100%）。
+	restoreBatchData(t, r, orig)
+	restoreBatchSave(t, r)
+	if _, err := r.Transfer(TransferRequest{
+		Operator: "bob", Reason: "恢复期间的合法转让", RequestID: "rt-i2-out", ItemID: "i2",
+		ExpectedOwner: "bob", ExpectedVer: 1, ToID: "alice", Price: 1000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 原整批重提：i2 已不属于 bob 版本 1，按清单顺序报告 i2 的版本冲突，
+	// 不是回放那次未保存的成功；整批拒绝，其余两件不发生转让。
+	res, err = r.TransferBatch(req)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("一件已转出后原整批应按持有版本规则拒绝: %v", err)
+	}
+	if res.Replayed || res.ItemID != "i2" || !errors.Is(res.Err, ErrConflict) || len(res.Items) != 0 {
+		t.Fatalf("冲突拒绝的结果异常: %+v", res)
+	}
+	// 其余条目与清单外藏品保持原状，i2 保留恢复期间的合法转让结果。
+	if h, _ := r.GetHolding("i1"); h.OwnerID != "bob" || h.Version != 1 {
+		t.Fatalf("拒绝不应转让其余条目 i1: %+v", h)
+	}
+	if h, _ := r.GetHolding("i2"); h.OwnerID != "alice" || h.Version != 2 {
+		t.Fatalf("i2 应保留恢复期间合法转让的结果: %+v", h)
+	}
+	if h, _ := r.GetHolding("i3"); h.OwnerID != "bob" || h.Version != 1 {
+		t.Fatalf("拒绝不应转让其余条目 i3: %+v", h)
+	}
+	if hist, _ := r.History("i1"); len(hist) != 1 || hist[0].Kind != "issue" {
+		t.Fatalf("拒绝不应为 i1 新增转让历史: %+v", hist)
+	}
+	if hist, _ := r.History("i3"); len(hist) != 1 || hist[0].Kind != "issue" {
+		t.Fatalf("拒绝不应为 i3 新增转让历史: %+v", hist)
+	}
+	// 整批拒绝不消耗历史序号：下一条仍是 9（已用到序号 8），也没有本次
+	// 计算出的版税应付。
+	if r.state.NextSeq != 8 {
+		t.Fatalf("NextSeq = %d，整批拒绝不应消耗历史序号，仍应为 8", r.state.NextSeq)
+	}
+	if _, err := r.TransferRoyalty(9); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("整批拒绝不应留下序号 9 的版税记录: %v", err)
+	}
+	if _, err := r.TransferRoyalty(10); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("整批拒绝不应留下序号 10 的版税记录: %v", err)
+	}
+	wantCarol := []PayableEntry{
+		{TxSeq: 7, ItemID: "i6", Price: 10000, Rate: 1000, Amount: 1000},
+		{TxSeq: 8, ItemID: "i2", Price: 1000, Rate: 10000, Amount: 1000},
+	}
+	if carolPay, err := r.PayablesOf("carol"); err != nil || !reflect.DeepEqual(carolPay, wantCarol) {
+		t.Fatalf("carol 应付 = %+v, err %v, want %+v", carolPay, err, wantCarol)
+	}
+	if davePay, err := r.PayablesOf("dave"); err != nil || len(davePay) != 1 || davePay[0].TxSeq != 7 {
+		t.Fatalf("dave 不应多出本次整批的应付: %+v, err %v", davePay, err)
+	}
+
+	// 这次冲突拒绝已保存：此后相同提交回放该拒绝，仍不转让任何一件。
+	res, err = r.TransferBatch(req)
+	if !errors.Is(err, ErrConflict) || !res.Replayed || res.ItemID != "i2" ||
+		!errors.Is(res.Err, ErrConflict) || len(res.Items) != 0 {
+		t.Fatalf("拒绝保存后再提应回放原拒绝: %+v, err %v", res, err)
+	}
+	if h, _ := r.GetHolding("i1"); h.OwnerID != "bob" || h.Version != 1 {
+		t.Fatalf("回放拒绝不应改变持有: %+v", h)
+	}
+	if h, _ := r.GetHolding("i3"); h.OwnerID != "bob" || h.Version != 1 {
+		t.Fatalf("回放拒绝不应改变持有: %+v", h)
+	}
+	if r.state.NextSeq != 8 {
+		t.Fatalf("回放拒绝不应消耗历史序号: NextSeq=%d", r.state.NextSeq)
+	}
+}
