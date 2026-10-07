@@ -235,6 +235,23 @@ func (r *Registry) GetAccount(id string) (Account, error) {
 
 // CreateSeries 登记一个系列，记录创建账户与文字元数据。创建账户必须
 // 已登记且可用；后续只有该账户能发行该系列的藏品或封存该系列。
+//
+// 登记以一次保存完成为准：新系列尚未原子替换原数据就发生保存错误（如数据
+// 位置暂时无法写入）时，返回本次实际的保存错误，不返回成功或编号冲突，也
+// 不能用失败后重新读取原数据时的错误取代它。即使原数据仍在、却暂时无法
+// 读取或解析、状态未能按磁盘重建，同一个仍打开的登记册也必须立即表现为该
+// 编号从未登记：GetSeries 返回 ErrNotFound，不能把它当成已存在的系列继续
+// 发行或封存；失败不占用系列编号，保存条件未恢复时用该编号再次登记仍实际
+// 尝试保存并返回当次保存错误，而不是因遗留系列返回 ErrAlreadyExists。原
+// 数据仍可读取的普通保存失败同样撤销本次登记，不依赖重新读取成功。随后另
+// 一次无关操作成功保存也不会把这个未保存的系列夹带落盘，关闭再打开登记册
+// 后它仍不存在。读写恢复后用该编号重新登记，以本次提交的创建账户与文字元
+// 数据为准，保存成功才显示为未封存的新系列，并可按已有规则发行藏品。此前
+// 成功登记的账户、系列及其封存状态，以及已有藏品的持有人、版本与历史都原
+// 样保留。空白编号返回 ErrInvalidArgument，元数据允许为空；创建账户不存
+// 在或已停用分别返回 ErrNotFound、ErrAccountInactive；已成功登记的系列编号
+// 返回 ErrAlreadyExists、不覆盖其创建账户、元数据或封存状态，这些业务拒绝
+// 不因数据位置恰好不可写而变成保存错误。
 func (r *Registry) CreateSeries(id, creatorID, metadata string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -255,7 +272,18 @@ func (r *Registry) CreateSeries(id, creatorID, metadata string) error {
 		return fmt.Errorf("%w: 系列 %s", ErrAlreadyExists, id)
 	}
 	r.state.Series[id] = series{ID: id, CreatorID: creatorID, Metadata: metadata}
-	return r.commit()
+	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则新系列已随旧
+		// 状态整体消失，删除是无害的兜底；磁盘暂时不可读、状态未能重建时
+		// 新系列仍在，显式删除，让当前仍打开的登记册表现为该编号从未登记
+		// ——GetSeries 返回 ErrNotFound、发行与封存不把它当成已存在的系列、
+		// 再次登记不会撞上遗留的 ErrAlreadyExists，也不被随后另一次成功
+		// 保存夹带落盘。返回实际写入错误，而非成功、编号冲突或重新读取时
+		// 的错误。
+		delete(r.state.Series, id)
+		return err
+	}
+	return nil
 }
 
 // SealSeries 封存系列。只有系列创建账户可以封存；封存后不能继续发行，
