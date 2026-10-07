@@ -1190,6 +1190,24 @@ func proxyTransferParamsSig(req ProxyTransferRequest) string {
 // 重新处理若保存成功不标回放，此后原样重提才回放已保存的结果。已经成功保存
 // 的拒绝仍按首次结果回放，改动该请求的业务内容仍报请求号冲突；必填内容缺失
 // 或引用不存在沿用原错误且不占用请求号。
+//
+// 成功代转同样以保存完成为准：持有换人、版本加一、转让历史、版税应付、授权
+// 使用标记与授权使用记录、藏品历史序号与授权历史序号、请求结果都尚未写入原
+// 登记册而保存失败（如数据位置暂时无法写入）时，返回实际保存错误而非代转
+// 成功，结果为空（不携带授权或藏品编号、前后持有人、版本、历史序号、价款、
+// 应付或余款，业务错误为空，不标回放）。即使失败后原数据暂时无法读取、状态
+// 未能按磁盘重建，这笔代转也必须从当前仍打开的登记册中整体撤销：藏品仍属于
+// 提交前持有人、版本不增加、双方持有列表与藏品历史保持原状，版税查询没有
+// 本次计算记录、收款账户不多出应付，授权没有使用时间或关联转让序号、授权
+// 历史没有本次使用记录，藏品历史序号、授权历史序号与请求号都不被消耗；失败
+// 前已存在的成功转让、授权与应付原样保留。原数据仍可读取的普通保存失败同样
+// 撤销本次代转，不依赖重新读取成功。随后另一次无关操作成功保存也不会把这笔
+// 未保存的代转一并写入，关闭再打开登记册后它同样不存在。读写恢复后受托人用
+// 原请求号、原因和授权编号重提，按重提时的授权、账户与持有状态重新判断：
+// 条件仍满足时正常完成一次代转（版本只增加一次、新增记录接续原有序号、价款
+// 仍取授权约定、余款仍归授权人、首次保存成功不标回放），此后原样重提才回放
+// 这一笔已保存结果；授权已到期、撤销或持有版本已变化时沿用对应拒绝，不能
+// 回放先前未保存的成功，也不因恢复状态而延长授权有效期。
 func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult, error) {
 	missing := []string{}
 	if strings.TrimSpace(req.Operator) == "" {
@@ -1248,6 +1266,18 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 	}
 
 	a := r.state.Authzs[req.AuthID]
+	// 回滚基点：本次成功代转的全部改动（持有换人、版本加一、藏品历史、版税
+	// 应付、藏品历史序号、授权使用标记与使用时间、授权使用记录、授权历史序号、
+	// 请求结果）都必须以一次保存完成为准。记录改动前的授权、持有、历史长度与
+	// 两类序号，保存失败且磁盘暂时不可读、状态未能按磁盘重建时据此整体撤销，
+	// 否则后续任何一次成功保存都会把这笔未保存的代转带进登记册，授权被消耗、
+	// 藏品已换人且该请求还可回放，造成"代转已完成"的幻影交易。
+	prevAuthz := a
+	prevHolding := r.state.Holdings[a.ItemID]
+	prevNextSeq := r.state.NextSeq
+	prevHistLen := len(r.state.History)
+	prevNextAuthSeq := r.state.NextAuthSeq
+	prevAuthEventsLen := len(r.state.AuthEvents)
 	// 代转价款以授权创建时记载为准，执行时不得改价；余款归转让前持有
 	// 人（授权人），不记给受托人。持有变化、历史、应付明细与授权使用
 	// 状态在同一临界区内一次落盘；历史记录实际受托账户并可按授权编号
@@ -1257,7 +1287,7 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 	a.UsedTxSeq = out.seq
 	a.UsedAt = now
 	r.state.Authzs[a.ID] = a
-	authSeq := r.state.NextAuthSeq + 1
+	authSeq := prevNextAuthSeq + 1
 	r.state.NextAuthSeq = authSeq
 	r.state.AuthEvents = append(r.state.AuthEvents, authzEvent{
 		Seq: authSeq, AuthID: a.ID, ItemID: a.ItemID, Kind: "use",
@@ -1270,6 +1300,24 @@ func (r *Registry) ProxyTransfer(req ProxyTransferRequest) (ProxyTransferResult,
 		Version: out.toVer(), TxSeq: out.seq,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次代转的全部
+		// 改动已随旧状态整体撤销（授权未使用、持有未换人、无本次历史与应付、
+		// 请求记录不存在、两类序号未消耗），写回的记录与磁盘一致，无需再动；
+		// 磁盘暂时不可读或无法解析、状态未能重建时本次改动仍在，据此把这笔
+		// 未保存的代转全部撤销，让当前已打开的登记册回到提交前状态，也不被
+		// 随后另一次成功保存带入。返回空结果：不带授权或藏品编号、前后持有人、
+		// 版本、历史序号、价款/应付/余款，不标回放、结果中业务错误为空，
+		// error 保留实际写入错误而非重新读取数据时的错误。
+		if _, pending := r.state.Requests[key]; pending {
+			delete(r.state.Requests, key)
+			delete(r.state.Royalties, out.seq)
+			r.state.History = r.state.History[:prevHistLen]
+			r.state.Holdings[a.ItemID] = prevHolding
+			r.state.NextSeq = prevNextSeq
+			r.state.AuthEvents = r.state.AuthEvents[:prevAuthEventsLen]
+			r.state.NextAuthSeq = prevNextAuthSeq
+			r.state.Authzs[a.ID] = prevAuthz
+		}
 		return ProxyTransferResult{}, err
 	}
 	return ProxyTransferResult{AuthID: a.ID, ItemID: a.ItemID, FromID: out.fromID,
