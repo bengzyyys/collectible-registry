@@ -402,6 +402,24 @@ func issueParamsSig(req IssueRequest) string {
 // 序号、业务错误为空、不标回放），请求号不被这次未保存的拒绝占用；保存
 // 条件恢复后用完全相同的请求重提，按当时的业务状态重新判断：拒绝条件仍
 // 在则重新保存此次拒绝并返回对应业务错误，状态已变为满足请求则正常发行。
+//
+// 成功发行同样以保存完成为准：藏品登记、初始持有（版本 1）、发行历史、
+// 历史序号与请求结果都尚未原子替换原登记册而保存失败（如数据位置暂时无法
+// 写入）时，返回实际保存错误而非发行成功，结果为空（不携带藏品编号、初始
+// 持有人、版本或历史序号，业务错误为空，不标回放）。即使失败后原数据暂时
+// 无法读取或解析、状态未能按磁盘重建，这次发行也必须从当前仍打开的登记册
+// 中整体撤销：GetItem、GetHolding 与 History 都返回 ErrNotFound，初始持有
+// 人的持有列表不增加这一件，也不能把它当成已发行藏品继续转让，藏品编号、
+// 操作者请求号与历史序号都不被消耗，此前没有成功发行过藏品的系列仍可按原
+// 条件设置版税规则；失败前已有的账户、系列、其他藏品及其持有与历史原样
+// 保留，随后另一次无关操作成功保存也不会把这件未保存的藏品、其发行历史或
+// 请求结果一并写入，关闭再打开登记册后它同样不存在。原数据仍可正常读取的
+// 普通保存失败同样撤销本次发行，不依赖重新读取成功。读写恢复后用原请求
+// 重提，必须按当时的账户、系列与编号状态重新判断：条件仍满足时才真正发行，
+// 初始持有版本为 1，新增一条包含本次操作者、原因与请求号的发行历史，序号
+// 紧接此前已有历史，这次返回不算回放；系列此时已封存则按既有规则拒绝。
+// 只有发行成功保存后，相同内容重提才回放首次成功结果；改变业务参数仍按
+// 原有的请求号冲突规则处理。
 func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return IssueResult{}, err
@@ -445,6 +463,15 @@ func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 		return IssueResult{ItemID: req.ItemID, Err: bizErr}, bizErr
 	}
 
+	// 回滚基点：本次成功发行的全部改动（藏品登记、初始持有、发行历史、
+	// 历史序号、请求结果）都必须以一次保存完成为准。记录改动前的历史长度
+	// 与历史序号；藏品编号在资格检查中已确认未被占用，回滚时直接删除。
+	// 保存失败且磁盘暂时不可读、状态未能按磁盘重建时据此整体撤销，否则后续
+	// 任何一次成功保存都会把这件未保存的藏品带进登记册，造成"已发行、可
+	// 回放"的幻影藏品。
+	prevNextSeq := r.state.NextSeq
+	prevHistLen := len(r.state.History)
+
 	seq := r.state.NextSeq + 1
 	r.state.NextSeq = seq
 	r.state.Items[req.ItemID] = item{
@@ -462,6 +489,20 @@ func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 		Params: sig, ItemID: req.ItemID, ToID: req.HolderID, Version: 1, TxSeq: seq,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已随旧
+		// 状态整体撤销（藏品与持有不存在、无本次历史、请求记录不存在、序号
+		// 未消耗），无需再动；磁盘暂时不可读、状态未能重建时本次改动仍在，
+		// 据此把这件未保存的藏品全部撤销，让当前已打开的登记册回到提交前
+		// 状态，也不被随后另一次成功保存带入。返回空结果：无藏品编号、无
+		// 持有人、无版本、无历史序号、不标回放、结果中业务错误为空，error
+		// 保留实际写入错误，而不是被随后重新读取原数据的错误替代。
+		if _, pending := r.state.Requests[key]; pending {
+			delete(r.state.Requests, key)
+			r.state.History = r.state.History[:prevHistLen]
+			delete(r.state.Holdings, req.ItemID)
+			delete(r.state.Items, req.ItemID)
+			r.state.NextSeq = prevNextSeq
+		}
 		return IssueResult{}, err
 	}
 	return IssueResult{ItemID: req.ItemID, OwnerID: req.HolderID, Version: 1, TxSeq: seq}, nil
