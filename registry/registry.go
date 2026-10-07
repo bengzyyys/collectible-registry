@@ -131,6 +131,21 @@ func (r *Registry) commit() error {
 // ---- 账户 ----
 
 // RegisterAccount 以唯一编号登记账户，登记后即为可用状态。
+//
+// 登记以一次保存完成为准：新账户尚未原子替换原数据就发生保存错误（如数据
+// 位置暂时无法写入）时，返回本次实际的保存错误，不返回成功或编号冲突，也
+// 不能用失败后重新读取原数据时的错误取代它。即使原数据仍在、却暂时无法
+// 读取或解析、状态未能按磁盘重建，同一个仍打开的登记册也必须立即表现为该
+// 编号从未登记：GetAccount 返回 ErrNotFound，藏品转让不能把它当成已登记的
+// 接收账户；失败不占用新账户编号，保存条件未恢复时用该编号再次登记仍实际
+// 尝试保存并返回当次保存错误，而不是因遗留账户返回 ErrAlreadyExists。原
+// 数据仍可读取的普通保存失败同样撤销本次登记，不依赖重新读取成功。随后另
+// 一次无关操作成功保存也不会把这个未保存的账户夹带落盘，关闭再打开登记册
+// 后它仍不存在。读写恢复后用该编号重新登记，以本次提交的元数据为准，保存
+// 成功才显示为可用账户。此前成功登记的账户及其元数据、可用或停用状态，以及
+// 已有藏品的持有人、版本与历史都原样保留。空白编号仍返回 ErrInvalidArgument，
+// 元数据允许为空；已成功登记的编号无论账户是否停用都返回 ErrAlreadyExists、
+// 不覆盖其记录，这些业务拒绝不因数据位置恰好不可写而变成保存错误。
 func (r *Registry) RegisterAccount(id, metadata string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -144,7 +159,18 @@ func (r *Registry) RegisterAccount(id, metadata string) error {
 		return fmt.Errorf("%w: 账户 %s", ErrAlreadyExists, id)
 	}
 	r.state.Accounts[id] = account{ID: id, Metadata: metadata, Active: true}
-	return r.commit()
+	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则新账户已随旧
+		// 状态整体消失，删除是无害的兜底；磁盘暂时不可读、状态未能重建时
+		// 新账户仍在，显式删除，让当前仍打开的登记册表现为该编号从未登记
+		// ——GetAccount 返回 ErrNotFound、转让不把它当成已登记的接收账户、
+		// 再次登记不会撞上遗留的 ErrAlreadyExists，也不被随后另一次成功
+		// 保存夹带落盘。返回实际写入错误，而非成功、编号冲突或重新读取时
+		// 的错误。
+		delete(r.state.Accounts, id)
+		return err
+	}
+	return nil
 }
 
 // DeactivateAccount 停用账户。停用后其原有藏品与历史仍可查询，但不能
