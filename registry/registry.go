@@ -962,6 +962,22 @@ func revokeAuthzParamsSig(req RevokeAuthorizationRequest) string {
 // 的提交才回放它；失败保存的请求不适用请求号冲突规则，该操作者用同号撤销另
 // 一份自己有权撤销的授权时不会遭遇请求号冲突。必填内容缺失及授权不存在仍
 // 直接按原错误拒绝、不占用请求号，不因当前无法保存而变成保存错误。
+//
+// 撤销成功同样以保存完成为准：授权状态、撤销时间、撤销记录、授权历史序号
+// 与请求结果都尚未写入原登记册而保存失败时，返回实际保存错误而非撤销成功，
+// 结果为空（无授权编号、无状态、业务错误为空、不标回放）。即使失败后原数据
+// 暂时无法读取、状态未能按磁盘重建，这份撤销也必须从当前仍打开的登记册中
+// 整体撤销：保留撤销前的授权内容与撤销时间，不新增撤销记录，授权历史序号与
+// 请求号都不被消耗；藏品的持有人、版本以及此前已保存的其他授权和历史原样
+// 保留，随后另一次正常操作成功保存也不会把这份未保存的撤销一并写入。失败后
+// 能否代转仍按原规则判断：持有版本未变、相关账户可用且未到期时受托人仍能
+// 正常使用；已到期或藏品已易手则继续返回相应业务拒绝，不能为恢复撤销前状态
+// 让旧授权重新可用。保存条件恢复后用同一操作者、授权编号、原因和请求号再次
+// 撤销，按此时的授权处理而不回放那次未保存的成功：授权仍未使用且允许撤销时
+// 本次才完成撤销并新增一条记录（记录本次生效的时间、操作者、原因与前后状态，
+// 不标回放），再原样提交才回放这一已保存结果。仅授权人能撤销、已使用授权
+// 拒绝撤销、已撤销授权再次撤销不新增记录的既有行为不变；这些已经保存的终态
+// 不被本次失败恢复。
 func (r *Registry) RevokeAuthorization(req RevokeAuthorizationRequest) (RevokeAuthorizationResult, error) {
 	missing := []string{}
 	if strings.TrimSpace(req.Operator) == "" {
@@ -1022,11 +1038,24 @@ func (r *Registry) RevokeAuthorization(req RevokeAuthorizationRequest) (RevokeAu
 			Params: sig, AuthID: req.AuthID,
 		}
 		if err := r.commit(); err != nil {
+			// 请求结果落盘失败：这次重放登记没有被记住，与撤销成功路径一致——
+			// 显式撤销尚未保存的请求号占用，覆盖磁盘暂时不可读、状态未能按磁盘
+			// 重建的情形，返回空结果与实际保存错误。已撤销终态本就存在于磁盘，
+			// 无需回滚授权本身。
+			delete(r.state.Requests, key)
 			return RevokeAuthorizationResult{}, err
 		}
 		return RevokeAuthorizationResult{AuthID: req.AuthID, Status: AuthRevoked}, nil
 	}
 
+	// 回滚基点：撤销以一次保存完成为准。记录撤销前的授权记录、授权历史
+	// 长度与历史序号，保存失败且磁盘暂时不可读、状态未能按磁盘重建时据此
+	// 整体撤销，否则这份未保存的撤销会留在当前已打开的登记册中（授权显示
+	// 已撤销、受托人被拒绝代转、重复撤销被幂等分支直接放行），并随之后另
+	// 一次成功保存夹带落盘，原请求重提也会被误当成已保存成功直接回放。
+	prevAuthz := a
+	prevAuthSeq := r.state.NextAuthSeq
+	prevEvents := len(r.state.AuthEvents)
 	from := AuthActive
 	if authzCurrentStatus(a, now) == AuthExpired {
 		from = AuthExpired
@@ -1034,7 +1063,7 @@ func (r *Registry) RevokeAuthorization(req RevokeAuthorizationRequest) (RevokeAu
 	a.Status = "revoked"
 	a.RevokedAt = now
 	r.state.Authzs[req.AuthID] = a
-	authSeq := r.state.NextAuthSeq + 1
+	authSeq := prevAuthSeq + 1
 	r.state.NextAuthSeq = authSeq
 	r.state.AuthEvents = append(r.state.AuthEvents, authzEvent{
 		Seq: authSeq, AuthID: req.AuthID, ItemID: a.ItemID, Kind: "revoke",
@@ -1046,6 +1075,20 @@ func (r *Registry) RevokeAuthorization(req RevokeAuthorizationRequest) (RevokeAu
 		Params: sig, AuthID: req.AuthID,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已随
+		// 旧状态整体撤销（授权仍未撤销、无本次撤销记录、请求记录不存在、
+		// 序号未消耗），写回的记录与磁盘一致，无需再动；磁盘暂时不可读、
+		// 状态未能重建时本次改动仍在，据此把这份未保存的撤销全部撤销，让
+		// 当前已打开的登记册回到提交前状态——授权内容与撤销时间恢复原样，
+		// 持有版本未变且账户可用、未到期时受托人仍可正常使用该授权；也不
+		// 被随后另一次成功保存带入。返回实际写入错误而非成功或业务拒绝，
+		// 结果为空：无授权编号、无状态、不标回放、结果中业务错误为空。
+		if _, pending := r.state.Requests[key]; pending {
+			delete(r.state.Requests, key)
+			r.state.AuthEvents = r.state.AuthEvents[:prevEvents]
+			r.state.NextAuthSeq = prevAuthSeq
+			r.state.Authzs[req.AuthID] = prevAuthz
+		}
 		return RevokeAuthorizationResult{}, err
 	}
 	return RevokeAuthorizationResult{AuthID: req.AuthID, Status: AuthRevoked}, nil
