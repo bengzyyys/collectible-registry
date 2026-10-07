@@ -402,6 +402,20 @@ func issueParamsSig(req IssueRequest) string {
 // 序号、业务错误为空、不标回放），请求号不被这次未保存的拒绝占用；保存
 // 条件恢复后用完全相同的请求重提，按当时的业务状态重新判断：拒绝条件仍
 // 在则重新保存此次拒绝并返回对应业务错误，状态已变为满足请求则正常发行。
+//
+// 成功发行同样以保存完成为准：藏品登记、初始持有、发行历史、历史序号与
+// 请求结果都尚未写入原登记册而保存失败（如数据位置暂时无法写入）时，返回
+// 实际保存错误而非发行成功，结果为空（不携带藏品编号、初始持有人、版本或
+// 历史序号，业务错误为空，不标回放）。即使失败后原数据暂时无法读取或解析、
+// 状态未能按磁盘重建，这次发行也必须从当前仍打开的登记册中整体撤销：查询
+// 该编号的藏品、持有和历史都返回 ErrNotFound，初始持有人的藏品列表不增加
+// 这一件，也不能把它当成已发行藏品继续转让，藏品编号、请求号与历史序号都
+// 不被消耗；失败前已有的账户、系列、其他藏品及其持有和历史原样保留，随后
+// 另一次无关操作成功保存也不会把这件未保存的藏品一并写入，关闭再打开同样
+// 看不到它。读写条件恢复后用原请求重提，按当时的账户、系列和编号状态重新
+// 判断：条件仍满足时真正发行（初始持有版本为 1、新增一条发行历史、序号紧
+// 接已有历史、不标回放），系列此时已封存则按已有规则拒绝；只有发行成功
+// 保存后，相同内容重提才回放首次成功结果，改变业务参数仍按请求号冲突处理。
 func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 	if err := req.validatePresent(); err != nil {
 		return IssueResult{}, err
@@ -445,6 +459,15 @@ func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 		return IssueResult{ItemID: req.ItemID, Err: bizErr}, bizErr
 	}
 
+	// 回滚基点：本次成功发行的全部改动（藏品登记、初始持有、发行历史、
+	// 历史序号、请求结果）都必须以一次保存完成为准。记录改动前的历史
+	// 长度与历史序号，保存失败且磁盘暂时不可读、状态未能按磁盘重建时
+	// 据此整体撤销，否则这件未保存的藏品会留在当前已打开的登记册中
+	// （可查、可转让、原请求重提被误当成已保存成功直接回放），并被随后
+	// 另一次成功保存夹带落盘。
+	prevNextSeq := r.state.NextSeq
+	prevHistLen := len(r.state.History)
+
 	seq := r.state.NextSeq + 1
 	r.state.NextSeq = seq
 	r.state.Items[req.ItemID] = item{
@@ -462,6 +485,20 @@ func (r *Registry) Issue(req IssueRequest) (IssueResult, error) {
 		Params: sig, ItemID: req.ItemID, ToID: req.HolderID, Version: 1, TxSeq: seq,
 	}
 	if err := r.commit(); err != nil {
+		// commit 失败时已尝试按磁盘内容重建状态：重建成功则本次改动已随
+		// 旧状态整体撤销（藏品、持有、历史与请求记录都不存在、序号未消耗），
+		// 无需再动；磁盘暂时不可读、状态未能重建时本次改动仍在，据此把这次
+		// 未保存的发行全部撤销，让当前已打开的登记册回到提交前状态，也不被
+		// 随后另一次成功保存带入。返回空结果：无藏品编号、无初始持有人、无
+		// 版本、无历史序号、不标回放、结果中业务错误为空，error 保留实际
+		// 写入错误。
+		if _, pending := r.state.Requests[key]; pending {
+			delete(r.state.Requests, key)
+			delete(r.state.Items, req.ItemID)
+			delete(r.state.Holdings, req.ItemID)
+			r.state.History = r.state.History[:prevHistLen]
+			r.state.NextSeq = prevNextSeq
+		}
 		return IssueResult{}, err
 	}
 	return IssueResult{ItemID: req.ItemID, OwnerID: req.HolderID, Version: 1, TxSeq: seq}, nil
